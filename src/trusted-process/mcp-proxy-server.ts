@@ -181,6 +181,9 @@ function redactCredentials(text: string, credentials: Record<string, string>): s
 const ESCALATION_POLL_INTERVAL_MS = 500;
 const DEFAULT_ESCALATION_TIMEOUT_SECONDS = 300;
 
+/** Auto-approve trusted input older than this is rejected as stale. */
+const TRUSTED_INPUT_STALENESS_MS = 120_000;
+
 /** Reads escalation timeout from env var, falling back to default. */
 function getEscalationTimeoutMs(): number {
   const envValue = process.env.ESCALATION_TIMEOUT_SECONDS;
@@ -262,7 +265,7 @@ async function waitForEscalationDecision(
  * Returns null when auto-approve is not enabled or env vars are missing.
  * Wraps with LLM logging middleware when a log path is provided.
  */
-async function createAutoApproveModel(): Promise<LanguageModelV3 | null> {
+async function createAutoApproveModel(sessionLogPath?: string): Promise<LanguageModelV3 | null> {
   if (process.env.AUTO_APPROVE_ENABLED !== 'true') return null;
 
   const modelId = process.env.AUTO_APPROVE_MODEL_ID;
@@ -274,15 +277,22 @@ async function createAutoApproveModel(): Promise<LanguageModelV3 | null> {
     const baseModel = await createLanguageModelFromEnv(modelId, apiKey);
 
     const llmLogPath = process.env.AUTO_APPROVE_LLM_LOG_PATH;
+    if (sessionLogPath) {
+      logToSessionFile(sessionLogPath, `Auto-approve model created: ${modelId}`);
+    }
     if (!llmLogPath) return baseModel;
 
     return wrapLanguageModel({
       model: baseModel,
       middleware: createLlmLoggingMiddleware(llmLogPath, { stepName: 'auto-approve' }),
     });
-  } catch {
+  } catch (err) {
     // Model creation failure should not prevent the proxy from starting.
     // Auto-approve simply won't be available for this session.
+    const message = err instanceof Error ? err.message : String(err);
+    if (sessionLogPath) {
+      logToSessionFile(sessionLogPath, `Auto-approve model creation failed for ${modelId}: ${message}`);
+    }
     return null;
   }
 }
@@ -599,23 +609,39 @@ export async function handleCallTool(
 
     // Try auto-approve before falling through to human escalation
     if (deps.autoApproveModel) {
-      const userMessage = readUserContext(deps.escalationDir);
-      if (userMessage) {
-        const autoResult = await autoApprove(
-          {
-            userMessage,
-            toolName: `${toolInfo.serverName}/${toolInfo.name}`,
-            escalationReason: evaluation.reason,
-            arguments: extractArgsForAutoApprove(argsForPolicy, annotation),
-          },
-          deps.autoApproveModel,
-        );
+      const userContext = readUserContext(deps.escalationDir);
+      if (userContext) {
+        // For PTY sessions, require trusted source from the mux
+        const isPtySession = process.env.IRONCURTAIN_PTY_SESSION === '1';
+        const sourceValid = !isPtySession || userContext.source === 'mux-trusted-input';
 
-        if (autoResult.decision === 'approve') {
-          autoApproved = true;
-          escalationResult = 'approved';
-          policyDecision.status = 'allow';
-          policyDecision.reason = `Auto-approved: ${autoResult.reasoning}`;
+        // Staleness check: for PTY sessions, treat missing/invalid/future timestamps as stale
+        let stale = isPtySession; // non-PTY sessions don't require timestamps
+        if (userContext.timestamp !== undefined) {
+          const tsMs = new Date(userContext.timestamp).getTime();
+          if (!Number.isNaN(tsMs)) {
+            const ageMs = Date.now() - tsMs;
+            stale = ageMs > TRUSTED_INPUT_STALENESS_MS || ageMs < 0;
+          }
+        }
+
+        if (sourceValid && !stale) {
+          const autoResult = await autoApprove(
+            {
+              userMessage: userContext.userMessage,
+              toolName: `${toolInfo.serverName}/${toolInfo.name}`,
+              escalationReason: evaluation.reason,
+              arguments: extractArgsForAutoApprove(argsForPolicy, annotation),
+            },
+            deps.autoApproveModel,
+          );
+
+          if (autoResult.decision === 'approve') {
+            autoApproved = true;
+            escalationResult = 'approved';
+            policyDecision.status = 'allow';
+            policyDecision.reason = `Auto-approved: ${autoResult.reasoning}`;
+          }
         }
       }
     }
@@ -792,7 +818,7 @@ async function main(): Promise<void> {
   const auditLog = new AuditLog(auditLogPath, { redact: auditRedaction });
   const circuitBreaker = new CallCircuitBreaker();
 
-  const autoApproveModel = await createAutoApproveModel();
+  const autoApproveModel = await createAutoApproveModel(sessionLogPath);
 
   const policyRoots = extractPolicyRoots(compiledPolicy, allowedDirectory ?? '/tmp');
   const mcpRoots = toMcpRoots(policyRoots);

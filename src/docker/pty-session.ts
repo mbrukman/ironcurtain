@@ -35,6 +35,7 @@ import {
   getSessionAuditLogPath,
   getSessionLogPath,
   getSessionLlmLogPath,
+  getSessionAutoApproveLlmLogPath,
   getPtyRegistryDir,
 } from '../config/paths.js';
 import * as logger from '../logger.js';
@@ -83,6 +84,7 @@ export async function runPtySession(options: PtySessionOptions): Promise<void> {
   logger.info(`LLM log: ${llmLogPath}`);
 
   // Patch config for this session
+  const autoApproveLlmLogPath = getSessionAutoApproveLlmLogPath(sessionId);
   const sessionConfig = {
     ...options.config,
     allowedDirectory: sandboxDir,
@@ -90,6 +92,8 @@ export async function runPtySession(options: PtySessionOptions): Promise<void> {
     escalationDir,
     sessionLogPath,
     llmLogPath,
+    autoApproveLlmLogPath,
+    isPtySession: true,
     mcpServers: JSON.parse(JSON.stringify(options.config.mcpServers)) as typeof options.config.mcpServers,
   };
 

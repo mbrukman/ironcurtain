@@ -73,6 +73,7 @@
     "@mozilla/readability": "^0.6.0",
     "@utcp/code-mode": "^1.2.11",
     "@utcp/mcp": "^1.1.1",
+    "@xterm/headless": "^6.0.0",
     "ai": "^6.0.104",
     "chalk": "^5.6.2",
     "cli-highlight": "^2.1.11",
@@ -86,6 +87,10 @@
     "turndown": "^7.2.2",
     "uuid": "^13.0.0",
     "zod": "^4.3.6"
+  },
+  "optionalDependencies": {
+    "node-pty": "^1.1.0",
+    "terminal-kit": "^3.1.2"
   },
   "overrides": {
     "minimatch": "^10.2.1"
