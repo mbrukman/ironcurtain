@@ -158,7 +158,7 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
       if (deps.getTabs().length === 0) {
         // Lazily create and start the splash screen
         if (!_splash) {
-          _splash = createSplashScreen(term, _cols, _layout.ptyViewportRows, _layout.ptyViewportY);
+          _splash = createSplashScreen(term, _cols, _layout.ptyViewportRows, _layout.ptyViewportY, _layout.overlayRows);
           _splash.start();
         }
         _splash.draw();
@@ -379,15 +379,17 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
     term.styleReset();
     currentY++;
 
-    // Input line
+    // Input line with visible block cursor
     clearLine(currentY);
     moveTo(2, currentY);
     term('> ');
-    term(deps.getInputBuffer());
+    const buf = deps.getInputBuffer();
+    const cp = deps.getCursorPos();
+    term(buf.slice(0, cp));
+    term.bgWhite.black(cp < buf.length ? buf[cp] : ' ');
+    term.styleReset();
+    term(buf.slice(cp + 1));
     term.eraseLineAfter();
-
-    // Position cursor at input
-    moveTo(2 + 2 + deps.getCursorPos(), currentY);
   }
 
   function drawActiveOverlay(): void {
@@ -602,7 +604,7 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
       _cols = newCols;
       _rows = newRows;
       recalcLayout();
-      _splash?.resize(_cols, _layout.ptyViewportRows, _layout.ptyViewportY);
+      _splash?.resize(_cols, _layout.ptyViewportRows, _layout.ptyViewportY, _layout.overlayRows);
     },
 
     destroy(): void {
