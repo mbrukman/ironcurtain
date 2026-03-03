@@ -19,6 +19,7 @@ import type { Terminal as TerminalType } from '@xterm/headless';
 import { calculateLayout, type InputMode, type Layout, type MuxTab } from './types.js';
 import type { ListenerState } from '../escalation/listener-state.js';
 import type { PickerState } from './mux-input-handler.js';
+import { createSplashScreen, type SplashScreen } from './mux-splash.js';
 
 // -- xterm.js color mode constants (from IBufferCell.getFgColorMode/getBgColorMode) --
 const CM_DEFAULT = 0;
@@ -97,6 +98,9 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
   let lastRenderTime = 0;
   let renderTimeout: ReturnType<typeof setTimeout> | null = null;
 
+  // Splash screen (shown when no tabs exist)
+  let _splash: SplashScreen | null = null;
+
   // Transient flash message
   let _flashMessage: string | null = null;
   let _flashTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -151,10 +155,25 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
   function drawPtyViewport(): void {
     const activeTab = deps.getActiveTab();
     if (!activeTab) {
-      for (let y = _layout.ptyViewportY; y < _layout.ptyViewportY + _layout.ptyViewportRows; y++) {
-        clearLine(y);
+      if (deps.getTabs().length === 0) {
+        // Lazily create and start the splash screen
+        if (!_splash) {
+          _splash = createSplashScreen(term, _cols, _layout.ptyViewportRows, _layout.ptyViewportY);
+          _splash.start();
+        }
+        _splash.draw();
+      } else {
+        for (let y = _layout.ptyViewportY; y < _layout.ptyViewportY + _layout.ptyViewportRows; y++) {
+          clearLine(y);
+        }
       }
       return;
+    }
+
+    // A tab is active -- tear down splash if it was showing
+    if (_splash) {
+      _splash.stop();
+      _splash = null;
     }
 
     const xtermTerminal = activeTab.bridge.terminal;
@@ -583,9 +602,12 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
       _cols = newCols;
       _rows = newRows;
       recalcLayout();
+      _splash?.resize(_cols, _layout.ptyViewportRows, _layout.ptyViewportY);
     },
 
     destroy(): void {
+      _splash?.stop();
+      _splash = null;
       if (renderTimeout) {
         clearTimeout(renderTimeout);
         renderTimeout = null;
