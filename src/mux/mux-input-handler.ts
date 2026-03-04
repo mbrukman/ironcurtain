@@ -13,6 +13,7 @@
 import { readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { expandTilde } from '../types/argument-roles.js';
+import { PASTE_START, PASTE_END } from './paste-interceptor.js';
 import type { InputMode, MuxAction } from './types.js';
 
 export type PickerPhase = 'menu' | 'browse';
@@ -58,6 +59,12 @@ export interface MuxInputHandler {
    * Returns a MuxAction describing what the orchestrator should do.
    */
   handleKey(key: string): MuxAction;
+
+  /**
+   * Processes a paste event (text delivered via bracketed paste).
+   * Returns a MuxAction describing what the orchestrator should do.
+   */
+  handlePaste(text: string): MuxAction;
 }
 
 /** terminal-kit key names for special keys. */
@@ -543,6 +550,32 @@ export function createMuxInputHandler(options?: MuxInputHandlerOptions): MuxInpu
         return handlePickerKey(key);
       }
       return handleCommandKey(key);
+    },
+
+    handlePaste(text: string): MuxAction {
+      if (!text) return { kind: 'none' };
+
+      if (_mode === 'pty') {
+        return { kind: 'write-pty', data: PASTE_START + text + PASTE_END };
+      }
+
+      if (_mode === 'command') {
+        _inputBuffer = _inputBuffer.slice(0, _cursorPos) + text + _inputBuffer.slice(_cursorPos);
+        _cursorPos += text.length;
+        return { kind: 'redraw-input' };
+      }
+
+      if (_pickerState?.phase === 'browse' && !_pickerState.inList) {
+        _pickerState.inputPath =
+          _pickerState.inputPath.slice(0, _pickerState.cursorPos) +
+          text +
+          _pickerState.inputPath.slice(_pickerState.cursorPos);
+        _pickerState.cursorPos += text.length;
+        resetEntrySelection(_pickerState);
+        return { kind: 'redraw-picker' };
+      }
+
+      return { kind: 'none' };
     },
   };
 }

@@ -185,4 +185,70 @@ describe('MuxInputHandler', () => {
       expect(handler.inputBuffer).toBe('');
     });
   });
+
+  describe('handlePaste', () => {
+    it('wraps text in bracketed paste markers for PTY mode', () => {
+      const handler = createMuxInputHandler();
+      const action = handler.handlePaste('hello world');
+      expect(action).toEqual({
+        kind: 'write-pty',
+        data: '\x1b[200~hello world\x1b[201~',
+      });
+    });
+
+    it('inserts text at cursor in command mode', () => {
+      const handler = createMuxInputHandler({ initialMode: 'command' });
+      const action = handler.handlePaste('pasted text');
+      expect(action).toEqual({ kind: 'redraw-input' });
+      expect(handler.inputBuffer).toBe('pasted text');
+      expect(handler.cursorPos).toBe(11);
+    });
+
+    it('inserts at mid-buffer cursor position in command mode', () => {
+      const handler = createMuxInputHandler({ initialMode: 'command' });
+      handler.handleKey('a');
+      handler.handleKey('b');
+      handler.handleKey('LEFT'); // cursor at 1
+      handler.handlePaste('XY');
+      expect(handler.inputBuffer).toBe('aXYb');
+      expect(handler.cursorPos).toBe(3);
+    });
+
+    it('returns none for empty paste', () => {
+      const handler = createMuxInputHandler();
+      expect(handler.handlePaste('')).toEqual({ kind: 'none' });
+    });
+
+    it('inserts into picker browse mode inputPath', () => {
+      const handler = createMuxInputHandler({ initialMode: 'command' });
+      handler.enterPickerMode();
+      // Navigate to browse phase
+      handler.handleKey('2'); // select "Existing directory"
+      expect(handler.pickerState?.phase).toBe('browse');
+
+      const action = handler.handlePaste('/tmp/test');
+      expect(action).toEqual({ kind: 'redraw-picker' });
+      expect(handler.pickerState?.inputPath).toContain('/tmp/test');
+    });
+
+    it('returns none in picker menu phase', () => {
+      const handler = createMuxInputHandler({ initialMode: 'command' });
+      handler.enterPickerMode();
+      expect(handler.pickerState?.phase).toBe('menu');
+
+      const action = handler.handlePaste('text');
+      expect(action).toEqual({ kind: 'none' });
+    });
+
+    it('returns none in picker browse mode with list focused', () => {
+      const handler = createMuxInputHandler({ initialMode: 'command' });
+      handler.enterPickerMode();
+      handler.handleKey('2'); // browse phase
+      // Move focus to list
+      handler.handleKey('DOWN');
+
+      const action = handler.handlePaste('text');
+      expect(action).toEqual({ kind: 'none' });
+    });
+  });
 });

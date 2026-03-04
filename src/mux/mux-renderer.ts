@@ -276,7 +276,7 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
             ` command mode \u00b7 ${pendingCount} escalation${pendingCount !== 1 ? 's' : ''} pending \u2014 /approve or /deny`,
           );
         } else {
-          term.dim(' command mode \u00b7 type a message to enable auto-approver');
+          term.dim(' command mode \u00b7 type a message to enable auto-approver \u00b7 Shift+drag to select');
         }
       }
       term.styleReset();

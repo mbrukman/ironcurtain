@@ -12,6 +12,7 @@ import { createMuxInputHandler, type MuxInputHandler } from './mux-input-handler
 import { createMuxEscalationManager, type MuxEscalationManager } from './mux-escalation-manager.js';
 import { createMuxRenderer, type MuxRenderer } from './mux-renderer.js';
 import { writeTrustedUserContext } from './trusted-input.js';
+import { createPasteInterceptor, type PasteInterceptor } from './paste-interceptor.js';
 import type { MuxTab, MuxAction } from './types.js';
 import { validateWorkspacePath } from '../session/workspace-validation.js';
 import * as logger from '../logger.js';
@@ -56,6 +57,7 @@ export function createMuxApp(options: MuxAppOptions): MuxApp {
   let inputHandler!: MuxInputHandler;
   let escalationManager!: MuxEscalationManager;
   let renderer!: MuxRenderer;
+  let pasteInterceptor!: PasteInterceptor;
 
   function getActiveTab(): MuxTab | undefined {
     return tabs[activeTabIndex];
@@ -375,6 +377,8 @@ export function createMuxApp(options: MuxAppOptions): MuxApp {
     if (!running) return;
     running = false;
 
+    pasteInterceptor.uninstall();
+
     for (const tab of tabs) {
       if (tab.bridge.alive) {
         tab.bridge.kill();
@@ -407,6 +411,13 @@ export function createMuxApp(options: MuxAppOptions): MuxApp {
       term.grabInput({ mouse: 'button' });
 
       inputHandler = createMuxInputHandler({ initialMode: autoSpawn ? 'pty' : 'command' });
+
+      pasteInterceptor = createPasteInterceptor((text) => {
+        if (!running) return;
+        const action = inputHandler.handlePaste(text);
+        void handleAction(action);
+      });
+      pasteInterceptor.install();
       escalationManager = createMuxEscalationManager();
 
       const { columns, rows } = process.stdout;
@@ -492,6 +503,7 @@ export function createMuxApp(options: MuxAppOptions): MuxApp {
       process.on('SIGHUP', handleSignal);
 
       process.on('exit', () => {
+        pasteInterceptor.uninstall();
         if (term) {
           term.grabInput(false);
         }
