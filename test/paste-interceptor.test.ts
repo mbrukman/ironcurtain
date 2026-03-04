@@ -14,7 +14,9 @@ function setupFakeStdin() {
   const realEmit = process.stdin.emit.bind(process.stdin);
   process.stdin.emit = function (event: string | symbol, ...args: unknown[]): boolean {
     if (event === 'data') {
-      emitted.push({ event: event as string, data: args[0] as string });
+      const raw = args[0];
+      const str = raw instanceof Buffer ? raw.toString('utf-8') : (raw as string);
+      emitted.push({ event: event as string, data: str });
     }
     return fakeEmitter.emit(event, ...args);
   } as typeof process.stdin.emit;
@@ -58,17 +60,18 @@ describe('PasteInterceptor', () => {
     interceptor.uninstall();
   });
 
-  it('handles paste markers split across two chunks', () => {
+  it('does not buffer escape sequences as partial start markers', () => {
     const pastes: string[] = [];
     const interceptor = createPasteInterceptor((text) => pastes.push(text));
     interceptor.install();
 
-    // Split start marker: "\x1b[200" in chunk 1, "~content\x1b[201~" in chunk 2
-    fake.simulateData('\x1b[200');
-    fake.simulateData('~hello' + PASTE_END);
+    // Escape sequences (arrows, etc.) must pass through immediately.
+    // A lone \x1b should NOT be buffered as a partial PASTE_START.
+    fake.simulateData('\x1b[A'); // cursor up
+    fake.simulateData('\x1b[B'); // cursor down
 
-    expect(pastes).toEqual(['hello']);
-    expect(fake.emitted).toEqual([]);
+    expect(pastes).toEqual([]);
+    expect(fake.emitted.map((e) => e.data)).toEqual(['\x1b[A', '\x1b[B']);
 
     interceptor.uninstall();
   });
@@ -87,14 +90,15 @@ describe('PasteInterceptor', () => {
     interceptor.uninstall();
   });
 
-  it('handles marker split at every byte boundary', () => {
+  it('handles end marker split at every byte boundary', () => {
     const pastes: string[] = [];
     const interceptor = createPasteInterceptor((text) => pastes.push(text));
     interceptor.install();
 
-    // Send start marker + content + end marker one character at a time
-    const full = PASTE_START + 'AB' + PASTE_END;
-    for (const ch of full) {
+    // Start marker must arrive atomically (as terminals send it)
+    fake.simulateData(PASTE_START + 'AB');
+    // Send end marker one character at a time
+    for (const ch of PASTE_END) {
       fake.simulateData(ch);
     }
 
@@ -103,18 +107,18 @@ describe('PasteInterceptor', () => {
     interceptor.uninstall();
   });
 
-  it('flushes partial marker that turns out not to be a marker', () => {
+  it('passes through lone ESC byte without buffering', () => {
     const pastes: string[] = [];
     const interceptor = createPasteInterceptor((text) => pastes.push(text));
     interceptor.install();
 
-    // Send something that starts like ESC[ but isn't a paste marker
-    fake.simulateData('\x1b[');
-    fake.simulateData('A'); // This is a cursor-up sequence, not 200~
+    // A lone \x1b must pass through immediately — it should NOT be
+    // buffered as a potential start of \x1b[200~
+    fake.simulateData('\x1b');
+    fake.simulateData('[A');
 
     expect(pastes).toEqual([]);
-    // The partial + the non-matching char should have been emitted
-    expect(fake.emitted.map((e) => e.data).join('')).toBe('\x1b[A');
+    expect(fake.emitted.map((e) => e.data)).toEqual(['\x1b', '[A']);
 
     interceptor.uninstall();
   });

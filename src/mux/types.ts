@@ -66,37 +66,50 @@ export interface Layout {
   readonly pickerRows: number;
   /** Y position where the picker overlay starts. */
   readonly pickerY: number;
+  /** Actual number of input rows allocated (after clamping). */
+  readonly inputLineRows: number;
 }
 
 // Layout constants
 const TAB_BAR_ROWS = 1;
 const FOOTER_ROWS = 2;
 const HINT_BAR_ROWS = 1;
-const INPUT_LINE_ROWS = 1;
+const MIN_INPUT_LINE_ROWS = 1;
+export const MAX_INPUT_LINE_ROWS = 6;
 const ESCALATION_ROWS_PER_ITEM = 4;
 const MAX_ESCALATION_PANEL_ROWS = 12;
-const MAX_OVERLAY_ROWS = 14;
 
 /**
  * Calculates the screen layout.
  *
  * The PTY viewport is CONSTANT: totalRows - TAB_BAR_ROWS - FOOTER_ROWS.
  * In command mode, the overlay paints over the bottom rows of the PTY viewport.
+ *
+ * @param inputLineRows - Number of input rows requested (default 1). Clamped
+ *   between MIN_INPUT_LINE_ROWS and MAX_INPUT_LINE_ROWS, then further clamped
+ *   by available viewport space.
  */
-export function calculateLayout(totalRows: number, mode: InputMode, pendingCount: number): Layout {
+export function calculateLayout(totalRows: number, mode: InputMode, pendingCount: number, inputLineRows = 1): Layout {
   // Ensure footer fits on screen; degrade gracefully on tiny terminals
   const footerRows = Math.min(FOOTER_ROWS, Math.max(0, totalRows - TAB_BAR_ROWS));
   const ptyViewportRows = Math.max(1, totalRows - TAB_BAR_ROWS - footerRows);
 
   let overlayRows = 0;
   let escalationPanelRows = 0;
+  let allocatedInputRows = MIN_INPUT_LINE_ROWS;
 
   if (mode === 'command') {
     if (pendingCount > 0) {
       escalationPanelRows = Math.min(pendingCount * ESCALATION_ROWS_PER_ITEM, MAX_ESCALATION_PANEL_ROWS);
     }
-    // Clamp overlay to available viewport so it never goes above the tab bar
-    overlayRows = Math.min(escalationPanelRows + HINT_BAR_ROWS + INPUT_LINE_ROWS, MAX_OVERLAY_ROWS, ptyViewportRows);
+    const actualInputRows = Math.min(Math.max(inputLineRows, MIN_INPUT_LINE_ROWS), MAX_INPUT_LINE_ROWS);
+    overlayRows = Math.min(
+      escalationPanelRows + HINT_BAR_ROWS + actualInputRows,
+      Math.floor(ptyViewportRows / 2),
+      ptyViewportRows,
+    );
+    // Store the actual input rows allocated (overlay might have been clamped)
+    allocatedInputRows = Math.max(1, overlayRows - escalationPanelRows - HINT_BAR_ROWS);
   }
 
   const pickerRows = mode === 'picker' ? Math.min(Math.floor(ptyViewportRows / 2), ptyViewportRows) : 0;
@@ -112,5 +125,6 @@ export function calculateLayout(totalRows: number, mode: InputMode, pendingCount
     escalationPanelRows,
     pickerRows,
     pickerY,
+    inputLineRows: mode === 'command' ? allocatedInputRows : 1,
   };
 }

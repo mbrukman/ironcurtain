@@ -7,6 +7,8 @@ import {
   buildSgrSequence,
   cellStyleEquals,
   colorEquals,
+  computeVisualLines,
+  cursorToVisualPosition,
   type TranslatedCell,
   type TermkitColor,
 } from '../src/mux/mux-renderer.js';
@@ -266,5 +268,96 @@ describe('buildSgrSequence', () => {
     const sgr = buildSgrSequence(makeCell({ bold: true, italic: true, underline: true }));
     // Should start with 0 (reset) then have 1, 3, 4
     expect(sgr).toMatch(/^0;1;3;4;/);
+  });
+});
+
+describe('computeVisualLines', () => {
+  it('empty string produces one empty visual line', () => {
+    const lines = computeVisualLines('', 20);
+    expect(lines).toEqual([{ text: '', bufferOffset: 0 }]);
+  });
+
+  it('short string fits in one visual line', () => {
+    const lines = computeVisualLines('hello', 20);
+    expect(lines).toEqual([{ text: 'hello', bufferOffset: 0 }]);
+  });
+
+  it('wraps at contentWidth', () => {
+    const lines = computeVisualLines('abcdefghij', 5);
+    expect(lines).toEqual([
+      { text: 'abcde', bufferOffset: 0 },
+      { text: 'fghij', bufferOffset: 5 },
+    ]);
+  });
+
+  it('handles hard newlines', () => {
+    const lines = computeVisualLines('abc\ndef', 20);
+    expect(lines).toEqual([
+      { text: 'abc', bufferOffset: 0 },
+      { text: 'def', bufferOffset: 4 },
+    ]);
+  });
+
+  it('handles mixed hard newlines and wrapping', () => {
+    const lines = computeVisualLines('abcde\nfghij', 3);
+    expect(lines).toEqual([
+      { text: 'abc', bufferOffset: 0 },
+      { text: 'de', bufferOffset: 3 },
+      { text: 'fgh', bufferOffset: 6 },
+      { text: 'ij', bufferOffset: 9 },
+    ]);
+  });
+
+  it('trailing newline produces an empty visual line', () => {
+    const lines = computeVisualLines('abc\n', 20);
+    expect(lines).toEqual([
+      { text: 'abc', bufferOffset: 0 },
+      { text: '', bufferOffset: 4 },
+    ]);
+  });
+
+  it('multiple consecutive newlines produce empty visual lines', () => {
+    const lines = computeVisualLines('a\n\nb', 20);
+    expect(lines).toEqual([
+      { text: 'a', bufferOffset: 0 },
+      { text: '', bufferOffset: 2 },
+      { text: 'b', bufferOffset: 3 },
+    ]);
+  });
+});
+
+describe('cursorToVisualPosition', () => {
+  it('cursor at start', () => {
+    const lines = computeVisualLines('hello', 20);
+    expect(cursorToVisualPosition(lines, 0)).toEqual({ row: 0, col: 0 });
+  });
+
+  it('cursor at end of single line', () => {
+    const lines = computeVisualLines('hello', 20);
+    expect(cursorToVisualPosition(lines, 5)).toEqual({ row: 0, col: 5 });
+  });
+
+  it('cursor at wrap point belongs to next line', () => {
+    const lines = computeVisualLines('abcdefghij', 5);
+    // Position 5 is start of second visual line
+    expect(cursorToVisualPosition(lines, 5)).toEqual({ row: 1, col: 0 });
+  });
+
+  it('cursor after hard newline', () => {
+    const lines = computeVisualLines('abc\ndef', 20);
+    // Position 4 is 'd' on second line
+    expect(cursorToVisualPosition(lines, 4)).toEqual({ row: 1, col: 0 });
+  });
+
+  it('cursor at end of buffer with trailing newline', () => {
+    const lines = computeVisualLines('abc\n', 20);
+    // Position 4 is on the empty line after \n
+    expect(cursorToVisualPosition(lines, 4)).toEqual({ row: 1, col: 0 });
+  });
+
+  it('cursor in middle of wrapped second line', () => {
+    const lines = computeVisualLines('abcdefghij', 5);
+    // Position 7 is 'h', col 2 of second visual line
+    expect(cursorToVisualPosition(lines, 7)).toEqual({ row: 1, col: 2 });
   });
 });

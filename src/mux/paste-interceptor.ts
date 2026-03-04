@@ -51,19 +51,12 @@ export function createPasteInterceptor(onPaste: (text: string) => void): PasteIn
       if (state === 'normal') {
         const startIdx = remaining.indexOf(PASTE_START);
         if (startIdx === -1) {
-          // Check if the end of `remaining` could be the start of a paste marker
-          const possiblePartial = findPartialMarker(remaining, PASTE_START);
-          if (possiblePartial > 0) {
-            // Buffer the potential partial marker
-            if (remaining.length - possiblePartial > 0) {
-              output.push(remaining.slice(0, remaining.length - possiblePartial));
-            }
-            partial = remaining.slice(remaining.length - possiblePartial);
-            remaining = '';
-          } else {
-            output.push(remaining);
-            remaining = '';
-          }
+          // Pass through directly. Terminal emulators send \x1b[200~ as a
+          // complete atomic write, so indexOf is sufficient — no need for
+          // partial marker detection which would buffer lone \x1b bytes and
+          // break all escape-sequence keystrokes (arrows, Escape, etc.).
+          output.push(remaining);
+          remaining = '';
         } else {
           // Emit everything before the marker
           if (startIdx > 0) {
@@ -127,7 +120,9 @@ export function createPasteInterceptor(onPaste: (text: string) => void): PasteIn
     let result = false;
     for (const out of outputs) {
       if (out.length > 0) {
-        result = originalEmit.call(this, 'data', out) || result;
+        // Re-emit as Buffer: terminal-kit's onStdin uses Buffer indexing
+        // (chunk[i] returns a byte number) which breaks on strings.
+        result = originalEmit.call(this, 'data', Buffer.from(out, 'utf-8')) || result;
       }
     }
     return result;
