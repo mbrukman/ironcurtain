@@ -117,14 +117,15 @@ describe('MuxInputHandler', () => {
       expect(action).toEqual({ kind: 'redraw-input' });
     });
 
-    it('Escape clears buffer and returns to PTY mode', () => {
+    it('Escape clears buffer and stays in command mode', () => {
       const handler = enterCommandMode();
       handler.handleKey('a');
       handler.handleKey('b');
       const action = handler.handleKey('ESCAPE');
-      expect(action).toEqual({ kind: 'enter-pty-mode' });
-      expect(handler.mode).toBe('pty');
+      expect(action).toEqual({ kind: 'redraw-input' });
+      expect(handler.mode).toBe('command');
       expect(handler.inputBuffer).toBe('');
+      expect(handler.cursorPos).toBe(0);
     });
 
     it('Ctrl-C clears the input buffer', () => {
@@ -183,6 +184,170 @@ describe('MuxInputHandler', () => {
       for (const c of 'hello') handler.handleKey(c);
       handler.handleKey('ENTER');
       expect(handler.inputBuffer).toBe('');
+    });
+
+    it('Up arrow moves cursor to previous line at same column', () => {
+      const handler = createMuxInputHandler({ initialMode: 'command' });
+      handler.handlePaste('abc\ndef\nghi');
+      // cursor at end: pos 11, on line 3 col 3
+      expect(handler.cursorPos).toBe(11);
+      handler.handleKey('UP');
+      // should be on line 2, col 3 → pos 7 ("abc\ndef|")
+      expect(handler.cursorPos).toBe(7);
+      handler.handleKey('UP');
+      // should be on line 1, col 3 → pos 3 ("abc|")
+      expect(handler.cursorPos).toBe(3);
+    });
+
+    it('Up arrow clamps to shorter line length', () => {
+      const handler = createMuxInputHandler({ initialMode: 'command' });
+      handler.handlePaste('ab\nc\ndef');
+      // cursor at end: pos 7, line 3 col 2
+      handler.handleKey('UP');
+      // line 2 is "c" (length 1), col clamped to 1 → pos 4
+      expect(handler.cursorPos).toBe(4);
+    });
+
+    it('Up arrow on first line is a no-op', () => {
+      const handler = createMuxInputHandler({ initialMode: 'command' });
+      handler.handlePaste('abc');
+      const action = handler.handleKey('UP');
+      expect(action).toEqual({ kind: 'none' });
+      expect(handler.cursorPos).toBe(3);
+    });
+
+    it('Down arrow moves cursor to next line at same column', () => {
+      const handler = createMuxInputHandler({ initialMode: 'command' });
+      handler.handlePaste('abc\ndef\nghi');
+      // move to beginning
+      handler.handleKey('HOME');
+      expect(handler.cursorPos).toBe(0);
+      handler.handleKey('DOWN');
+      // line 2, col 0 → pos 4
+      expect(handler.cursorPos).toBe(4);
+      handler.handleKey('DOWN');
+      // line 3, col 0 → pos 8
+      expect(handler.cursorPos).toBe(8);
+    });
+
+    it('Down arrow clamps to shorter line length', () => {
+      const handler = createMuxInputHandler({ initialMode: 'command' });
+      handler.handlePaste('abc\nd');
+      handler.handleKey('HOME');
+      // cursor at pos 0, line 1 col 0
+      // move right to col 2
+      handler.handleKey('RIGHT');
+      handler.handleKey('RIGHT');
+      expect(handler.cursorPos).toBe(2);
+      handler.handleKey('DOWN');
+      // line 2 is "d" (length 1), col clamped to 1 → pos 5
+      expect(handler.cursorPos).toBe(5);
+    });
+
+    it('Down arrow on last line is a no-op', () => {
+      const handler = createMuxInputHandler({ initialMode: 'command' });
+      handler.handlePaste('abc');
+      handler.handleKey('HOME');
+      const action = handler.handleKey('DOWN');
+      expect(action).toEqual({ kind: 'none' });
+      expect(handler.cursorPos).toBe(0);
+    });
+
+    it('Home key moves cursor to position 0', () => {
+      const handler = enterCommandMode();
+      handler.handleKey('a');
+      handler.handleKey('b');
+      handler.handleKey('c');
+      expect(handler.cursorPos).toBe(3);
+      const action = handler.handleKey('HOME');
+      expect(action).toEqual({ kind: 'redraw-input' });
+      expect(handler.cursorPos).toBe(0);
+    });
+
+    it('End key moves cursor to end of buffer', () => {
+      const handler = enterCommandMode();
+      handler.handleKey('a');
+      handler.handleKey('b');
+      handler.handleKey('c');
+      handler.handleKey('LEFT');
+      handler.handleKey('LEFT');
+      expect(handler.cursorPos).toBe(1);
+      const action = handler.handleKey('END');
+      expect(action).toEqual({ kind: 'redraw-input' });
+      expect(handler.cursorPos).toBe(3);
+    });
+  });
+
+  describe('handlePaste', () => {
+    it('wraps text in bracketed paste markers for PTY mode', () => {
+      const handler = createMuxInputHandler();
+      const action = handler.handlePaste('hello world');
+      expect(action).toEqual({
+        kind: 'write-pty',
+        data: '\x1b[200~hello world\x1b[201~',
+      });
+    });
+
+    it('inserts text at cursor in command mode', () => {
+      const handler = createMuxInputHandler({ initialMode: 'command' });
+      const action = handler.handlePaste('pasted text');
+      expect(action).toEqual({ kind: 'redraw-input' });
+      expect(handler.inputBuffer).toBe('pasted text');
+      expect(handler.cursorPos).toBe(11);
+    });
+
+    it('inserts at mid-buffer cursor position in command mode', () => {
+      const handler = createMuxInputHandler({ initialMode: 'command' });
+      handler.handleKey('a');
+      handler.handleKey('b');
+      handler.handleKey('LEFT'); // cursor at 1
+      handler.handlePaste('XY');
+      expect(handler.inputBuffer).toBe('aXYb');
+      expect(handler.cursorPos).toBe(3);
+    });
+
+    it('preserves newlines (normalized to LF) in command mode', () => {
+      const handler = createMuxInputHandler({ initialMode: 'command' });
+      handler.handlePaste('line1\nline2\r\nline3');
+      expect(handler.inputBuffer).toBe('line1\nline2\nline3');
+      expect(handler.cursorPos).toBe(17);
+    });
+
+    it('returns none for empty paste', () => {
+      const handler = createMuxInputHandler();
+      expect(handler.handlePaste('')).toEqual({ kind: 'none' });
+    });
+
+    it('inserts into picker browse mode inputPath', () => {
+      const handler = createMuxInputHandler({ initialMode: 'command' });
+      handler.enterPickerMode();
+      // Navigate to browse phase
+      handler.handleKey('2'); // select "Existing directory"
+      expect(handler.pickerState?.phase).toBe('browse');
+
+      const action = handler.handlePaste('/tmp/test');
+      expect(action).toEqual({ kind: 'redraw-picker' });
+      expect(handler.pickerState?.inputPath).toContain('/tmp/test');
+    });
+
+    it('returns none in picker menu phase', () => {
+      const handler = createMuxInputHandler({ initialMode: 'command' });
+      handler.enterPickerMode();
+      expect(handler.pickerState?.phase).toBe('menu');
+
+      const action = handler.handlePaste('text');
+      expect(action).toEqual({ kind: 'none' });
+    });
+
+    it('returns none in picker browse mode with list focused', () => {
+      const handler = createMuxInputHandler({ initialMode: 'command' });
+      handler.enterPickerMode();
+      handler.handleKey('2'); // browse phase
+      // Move focus to list
+      handler.handleKey('DOWN');
+
+      const action = handler.handlePaste('text');
+      expect(action).toEqual({ kind: 'none' });
     });
   });
 });

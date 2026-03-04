@@ -96,7 +96,7 @@ interface WordLayout {
   glyphs: Array<{ char: string; glyph: Glyph; offsetX: number }>;
 }
 
-const INFO_ROWS = 10; // header + blank + 4 commands + blank + ctrl-a + margin
+const INFO_ROWS = 11; // header + blank + 4 commands + blank + ctrl-a + shift+drag + margin
 
 function computeWordLayout(cols: number, viewportRows: number): WordLayout | null {
   let totalWidth = 0;
@@ -295,6 +295,7 @@ export function createSplashScreen(
       { cmd: '/quit', desc: 'Exit the multiplexer' },
       null,
       { cmd: 'Ctrl-A', desc: 'Toggle command / PTY mode' },
+      { cmd: 'Shift+drag', desc: 'Select text for copy' },
     ];
 
     const CMD_WIDTH = 14;

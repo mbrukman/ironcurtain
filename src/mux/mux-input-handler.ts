@@ -13,6 +13,7 @@
 import { readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { expandTilde } from '../types/argument-roles.js';
+import { PASTE_START, PASTE_END } from './paste-interceptor.js';
 import type { InputMode, MuxAction } from './types.js';
 
 export type PickerPhase = 'menu' | 'browse';
@@ -58,6 +59,12 @@ export interface MuxInputHandler {
    * Returns a MuxAction describing what the orchestrator should do.
    */
   handleKey(key: string): MuxAction;
+
+  /**
+   * Processes a paste event (text delivered via bracketed paste).
+   * Returns a MuxAction describing what the orchestrator should do.
+   */
+  handlePaste(text: string): MuxAction;
 }
 
 /** terminal-kit key names for special keys. */
@@ -72,6 +79,8 @@ const RIGHT = 'RIGHT';
 const UP = 'UP';
 const DOWN = 'DOWN';
 const TAB = 'TAB';
+const HOME = 'HOME';
+const END = 'END';
 
 /**
  * Maps terminal-kit key names to raw escape sequences for the PTY.
@@ -428,12 +437,11 @@ export function createMuxInputHandler(options?: MuxInputHandlerOptions): MuxInpu
       return { kind: 'enter-pty-mode' };
     }
 
-    // Escape: discard buffer, return to PTY mode
+    // Escape: clear buffer, stay in command mode
     if (key === ESCAPE) {
-      _mode = 'pty';
       _inputBuffer = '';
       _cursorPos = 0;
-      return { kind: 'enter-pty-mode' };
+      return { kind: 'redraw-input' };
     }
 
     // Ctrl-C: clear input buffer
@@ -501,6 +509,41 @@ export function createMuxInputHandler(options?: MuxInputHandlerOptions): MuxInpu
       return { kind: 'none' };
     }
 
+    // Up: move to same column on previous line
+    if (key === UP) {
+      const lastNl = _inputBuffer.lastIndexOf('\n', _cursorPos - 1);
+      if (lastNl === -1) return { kind: 'none' }; // already on first line
+      const col = _cursorPos - lastNl - 1;
+      const prevNl = _inputBuffer.lastIndexOf('\n', lastNl - 1);
+      const prevLineLen = lastNl - (prevNl + 1);
+      _cursorPos = prevNl + 1 + Math.min(col, prevLineLen);
+      return { kind: 'redraw-input' };
+    }
+
+    // Down: move to same column on next line
+    if (key === DOWN) {
+      const lastNl = _inputBuffer.lastIndexOf('\n', _cursorPos - 1);
+      const col = lastNl === -1 ? _cursorPos : _cursorPos - lastNl - 1;
+      const nextNl = _inputBuffer.indexOf('\n', _cursorPos);
+      if (nextNl === -1) return { kind: 'none' }; // already on last line
+      const nextNextNl = _inputBuffer.indexOf('\n', nextNl + 1);
+      const nextLineLen = nextNextNl === -1 ? _inputBuffer.length - nextNl - 1 : nextNextNl - nextNl - 1;
+      _cursorPos = nextNl + 1 + Math.min(col, nextLineLen);
+      return { kind: 'redraw-input' };
+    }
+
+    // Home: move cursor to beginning
+    if (key === HOME) {
+      _cursorPos = 0;
+      return { kind: 'redraw-input' };
+    }
+
+    // End: move cursor to end
+    if (key === END) {
+      _cursorPos = _inputBuffer.length;
+      return { kind: 'redraw-input' };
+    }
+
     // Alt-1 through Alt-9: quick tab switching
     const altMatch = /^ALT_(\d)$/.exec(key);
     if (altMatch) {
@@ -543,6 +586,36 @@ export function createMuxInputHandler(options?: MuxInputHandlerOptions): MuxInpu
         return handlePickerKey(key);
       }
       return handleCommandKey(key);
+    },
+
+    handlePaste(text: string): MuxAction {
+      if (!text) return { kind: 'none' };
+
+      if (_mode === 'pty') {
+        return { kind: 'write-pty', data: PASTE_START + text + PASTE_END };
+      }
+
+      if (_mode === 'command') {
+        // Preserve newlines (normalize line endings to \n)
+        const sanitized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+        _inputBuffer = _inputBuffer.slice(0, _cursorPos) + sanitized + _inputBuffer.slice(_cursorPos);
+        _cursorPos += sanitized.length;
+        return { kind: 'redraw-input' };
+      }
+
+      if (_pickerState?.phase === 'browse' && !_pickerState.inList) {
+        // Paths are single-line: strip all newlines
+        const sanitized = text.replace(/[\r\n]+/g, ' ');
+        _pickerState.inputPath =
+          _pickerState.inputPath.slice(0, _pickerState.cursorPos) +
+          sanitized +
+          _pickerState.inputPath.slice(_pickerState.cursorPos);
+        _pickerState.cursorPos += sanitized.length;
+        resetEntrySelection(_pickerState);
+        return { kind: 'redraw-picker' };
+      }
+
+      return { kind: 'none' };
     },
   };
 }

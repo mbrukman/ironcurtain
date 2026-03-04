@@ -44,6 +44,62 @@ export interface TranslatedCell {
   readonly strikethrough: boolean;
 }
 
+/** A visual line produced by soft-wrapping the input buffer. */
+export interface VisualLine {
+  /** Content of this visual line (no trailing \n). */
+  readonly text: string;
+  /** Character offset in the original buffer where this visual line starts. */
+  readonly bufferOffset: number;
+}
+
+/**
+ * Splits the input buffer into visual lines by honoring hard newlines
+ * and soft-wrapping at `contentWidth` characters.
+ */
+export function computeVisualLines(buffer: string, contentWidth: number): VisualLine[] {
+  if (buffer.length === 0) {
+    return [{ text: '', bufferOffset: 0 }];
+  }
+
+  const width = Math.max(1, contentWidth);
+  const result: VisualLine[] = [];
+  const logicalLines = buffer.split('\n');
+  let offset = 0;
+
+  for (let i = 0; i < logicalLines.length; i++) {
+    const line = logicalLines[i];
+    if (line.length === 0) {
+      result.push({ text: '', bufferOffset: offset });
+    } else {
+      for (let j = 0; j < line.length; j += width) {
+        result.push({ text: line.slice(j, j + width), bufferOffset: offset + j });
+      }
+    }
+    // Account for the \n character between logical lines
+    offset += line.length + 1;
+  }
+
+  return result;
+}
+
+/**
+ * Maps a buffer cursor position to a visual row and column
+ * within the visual lines array.
+ */
+export function cursorToVisualPosition(lines: VisualLine[], cursorPos: number): { row: number; col: number } {
+  // Walk backwards through lines to find the last one whose bufferOffset <= cursorPos
+  // and where cursorPos <= bufferOffset + text.length.
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (line.bufferOffset <= cursorPos && cursorPos <= line.bufferOffset + line.text.length) {
+      return { row: i, col: cursorPos - line.bufferOffset };
+    }
+  }
+  // Fallback: end of last line
+  const last = lines[lines.length - 1];
+  return { row: lines.length - 1, col: last.text.length };
+}
+
 /** Minimum render interval (~60 FPS). */
 const MIN_RENDER_INTERVAL_MS = 16;
 
@@ -101,13 +157,30 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
   // Splash screen (shown when no tabs exist)
   let _splash: SplashScreen | null = null;
 
+  // Multiline input scroll offset (first visible visual line index)
+  let _inputScrollOffset = 0;
+
+  // Cached visual lines from recalcLayout(), reused by drawCommandOverlay()
+  let _cachedVisualLines: VisualLine[] = [{ text: '', bufferOffset: 0 }];
+
   // Transient flash message
   let _flashMessage: string | null = null;
   let _flashTimeout: ReturnType<typeof setTimeout> | null = null;
   const FLASH_DURATION_MS = 3000;
 
+  /** Content width for the input area: _cols minus 2-char left margin minus 2-char prompt prefix. */
+  function contentWidth(): number {
+    return Math.max(1, _cols - 4);
+  }
+
   function recalcLayout(): void {
-    _layout = calculateLayout(_rows, deps.getMode(), deps.getPendingCount());
+    if (deps.getMode() === 'command') {
+      _cachedVisualLines = computeVisualLines(deps.getInputBuffer(), contentWidth());
+    } else {
+      _cachedVisualLines = [{ text: '', bufferOffset: 0 }];
+      _inputScrollOffset = 0;
+    }
+    _layout = calculateLayout(_rows, deps.getMode(), deps.getPendingCount(), _cachedVisualLines.length);
   }
 
   function moveTo(x: number, y: number): void {
@@ -276,7 +349,7 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
             ` command mode \u00b7 ${pendingCount} escalation${pendingCount !== 1 ? 's' : ''} pending \u2014 /approve or /deny`,
           );
         } else {
-          term.dim(' command mode \u00b7 type a message to enable auto-approver');
+          term.dim(' command mode \u00b7 type a message to enable auto-approver \u00b7 Shift+drag to select');
         }
       }
       term.styleReset();
@@ -292,7 +365,7 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
       term.dim(' pty  ');
       term.bgWhite.black(' Esc ');
       term.styleReset();
-      term.dim(' back');
+      term.dim(' clear');
       term.eraseLineAfter();
 
       // Row 2: flash message or trusted input hint
@@ -395,20 +468,56 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
     term.styleReset();
     currentY++;
 
-    // Input line with visible block cursor
-    clearLine(currentY);
-    moveTo(2, currentY);
-    term('> ');
-    const buf = deps.getInputBuffer();
+    // Multiline input area (visual lines cached by recalcLayout)
     const cp = deps.getCursorPos();
-    term(buf.slice(0, cp));
-    term.bgWhite.black(cp < buf.length ? buf[cp] : ' ');
-    term.styleReset();
-    term(buf.slice(cp + 1));
-    term.eraseLineAfter();
+    const visualLines = _cachedVisualLines;
+    const cursorVis = cursorToVisualPosition(visualLines, cp);
+    const allocatedRows = _layout.inputLineRows;
 
-    // Keep the real terminal cursor aligned with the logical input cursor for accessibility
-    moveTo(2 + 2 + cp, currentY);
+    // Adjust scroll to keep cursor visible
+    if (cursorVis.row < _inputScrollOffset) {
+      _inputScrollOffset = cursorVis.row;
+    } else if (cursorVis.row >= _inputScrollOffset + allocatedRows) {
+      _inputScrollOffset = cursorVis.row - allocatedRows + 1;
+    }
+
+    // Render each visible visual line
+    for (let i = 0; i < allocatedRows; i++) {
+      const visLineIdx = _inputScrollOffset + i;
+      clearLine(currentY);
+      moveTo(2, currentY);
+
+      // Prompt: "> " on the first visual line, "  " on continuation lines
+      if (visLineIdx === 0) {
+        term('> ');
+      } else {
+        term('  ');
+      }
+
+      if (visLineIdx < visualLines.length) {
+        const vLine = visualLines[visLineIdx];
+        if (visLineIdx === cursorVis.row) {
+          // This line contains the cursor
+          term(vLine.text.slice(0, cursorVis.col));
+          term.bgWhite.black(cursorVis.col < vLine.text.length ? vLine.text[cursorVis.col] : ' ');
+          term.styleReset();
+          term(vLine.text.slice(cursorVis.col + 1));
+        } else {
+          term(vLine.text);
+        }
+      } else if (i === 0) {
+        // Empty buffer: show cursor on blank line
+        term.bgWhite.black(' ');
+        term.styleReset();
+      }
+
+      term.eraseLineAfter();
+      currentY++;
+    }
+
+    // Position real terminal cursor for accessibility
+    const cursorScreenRow = startY + _layout.escalationPanelRows + 1 + (cursorVis.row - _inputScrollOffset);
+    moveTo(2 + 2 + cursorVis.col, cursorScreenRow);
   }
 
   function drawActiveOverlay(): void {
