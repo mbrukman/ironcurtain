@@ -239,8 +239,6 @@ export function createMuxApp(options: MuxAppOptions): MuxApp {
             if (bridge.alive) bridge.write('\r');
           }, 50);
         }
-        // Return to PTY mode after sending trusted input
-        inputHandler.handleKey('CTRL_A');
         renderer.fullRedraw();
         break;
       }
