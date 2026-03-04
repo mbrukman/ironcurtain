@@ -47,6 +47,9 @@ function createTestConfig(overrides: { anthropicApiKey?: string } = {}): IronCur
       autoApprove: { enabled: false, modelId: 'anthropic:claude-haiku-4-5' },
       auditRedaction: { enabled: true },
       serverCredentials: {},
+      gooseProvider: 'anthropic',
+      gooseModel: 'claude-sonnet-4-20250514',
+      preferredDockerAgent: 'claude-code',
     },
   };
 }
@@ -146,7 +149,7 @@ describe('resolveSessionMode', () => {
       });
 
       expect(result.mode).toEqual({ kind: 'docker', agent: 'claude-code', authKind: 'apikey' });
-      expect(result.reason).toBe('Docker available, ANTHROPIC_API_KEY detected');
+      expect(result.reason).toBe('Docker available, API key detected');
     });
 
     it('selects Docker with OAuth when available', async () => {
