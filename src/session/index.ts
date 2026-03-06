@@ -6,9 +6,11 @@
  * are not exported -- callers depend on the Session interface only.
  */
 
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { loadConfig } from '../config/index.js';
 import {
+  getIronCurtainHome,
   getSessionDir,
   getSessionSandboxDir,
   getSessionEscalationDir,
@@ -21,6 +23,7 @@ import type { IronCurtainConfig } from '../config/types.js';
 import * as logger from '../logger.js';
 import { AgentSession } from './agent-session.js';
 import { SessionError } from './errors.js';
+import { isEqualOrInside } from './workspace-validation.js';
 import { createSessionId } from './types.js';
 import type { Session, SessionId, SessionOptions, SessionMode } from './types.js';
 
@@ -70,13 +73,7 @@ async function createBuiltinSession(options: SessionOptions): Promise<Session> {
   }
 
   const loggerWasActive = logger.isActive();
-  const sessionConfig = buildSessionConfig(
-    config,
-    effectiveSessionId,
-    sessionId,
-    options.resumeSessionId,
-    options.workspacePath,
-  );
+  const sessionConfig = buildSessionConfig(config, effectiveSessionId, sessionId, options);
 
   const session = new AgentSession(sessionConfig.config, sessionId, sessionConfig.escalationDir, options);
 
@@ -111,13 +108,7 @@ async function createDockerSession(
   const effectiveSessionId = options.resumeSessionId ?? sessionId;
 
   const loggerWasActive = logger.isActive();
-  const sessionConfig = buildSessionConfig(
-    config,
-    effectiveSessionId,
-    sessionId,
-    options.resumeSessionId,
-    options.workspacePath,
-  );
+  const sessionConfig = buildSessionConfig(config, effectiveSessionId, sessionId, options);
 
   const { prepareDockerInfrastructure } = await import('../docker/docker-infrastructure.js');
   const { DockerAgentSession } = await import('../docker/docker-agent-session.js');
@@ -148,6 +139,7 @@ async function createDockerSession(
     useTcp: infra.useTcp,
     onEscalation: options.onEscalation,
     onEscalationExpired: options.onEscalationExpired,
+    onEscalationResolved: options.onEscalationResolved,
     onDiagnostic: options.onDiagnostic,
     preBuiltInfrastructure: {
       systemPrompt: infra.systemPrompt,
@@ -180,6 +172,38 @@ interface SessionDirConfig {
 }
 
 /**
+ * Validates that a policyDir path resolves to a location under the
+ * IronCurtain home directory. Prevents loading attacker-controlled
+ * policy files from arbitrary filesystem locations.
+ *
+ * @throws {SessionError} if the path escapes the IronCurtain home.
+ */
+function validatePolicyDir(policyDir: string): void {
+  // Use realpathSync to canonicalize and follow symlinks, preventing
+  // symlink escapes (e.g., ~/.ironcurtain/evil -> /etc/attacker-policy).
+  // Fall back to resolve() if the path doesn't exist yet.
+  let resolvedPolicy: string;
+  try {
+    resolvedPolicy = realpathSync(resolve(policyDir));
+  } catch {
+    resolvedPolicy = resolve(policyDir);
+  }
+  let home: string;
+  try {
+    home = realpathSync(resolve(getIronCurtainHome()));
+  } catch {
+    home = resolve(getIronCurtainHome());
+  }
+
+  if (!isEqualOrInside(resolvedPolicy, home)) {
+    throw new SessionError(
+      `policyDir must be under the IronCurtain home directory (${home}). ` + `Received: ${resolvedPolicy}`,
+      'SESSION_INIT_FAILED',
+    );
+  }
+}
+
+/**
  * Shared session directory setup and config patching used by both session modes.
  *
  * When workspacePath is provided, it replaces the session sandbox as the
@@ -191,9 +215,13 @@ function buildSessionConfig(
   config: IronCurtainConfig,
   effectiveSessionId: string,
   sessionId: SessionId,
-  resumeSessionId?: string,
-  workspacePath?: string,
+  opts: Pick<SessionOptions, 'resumeSessionId' | 'workspacePath' | 'policyDir' | 'disableAutoApprove'> = {},
 ): SessionDirConfig {
+  const { resumeSessionId, workspacePath, policyDir, disableAutoApprove } = opts;
+  if (policyDir) {
+    validatePolicyDir(policyDir);
+  }
+
   const sessionDir = getSessionDir(effectiveSessionId);
   const sandboxDir = workspacePath ?? getSessionSandboxDir(effectiveSessionId);
   const escalationDir = getSessionEscalationDir(effectiveSessionId);
@@ -230,7 +258,20 @@ function buildSessionConfig(
     sessionLogPath,
     llmLogPath,
     autoApproveLlmLogPath,
+    // When per-job policy is provided, split generated dir:
+    // generatedDir -> per-job dir (compiled policy + dynamic lists)
+    // toolAnnotationsDir -> global dir (tool annotations)
+    ...(policyDir
+      ? {
+          generatedDir: policyDir,
+          toolAnnotationsDir: config.toolAnnotationsDir ?? config.generatedDir,
+        }
+      : {}),
     mcpServers: JSON.parse(JSON.stringify(config.mcpServers)) as typeof config.mcpServers,
+    // Disable auto-approver for headless sessions (no interactive user context)
+    ...(disableAutoApprove
+      ? { userConfig: { ...config.userConfig, autoApprove: { ...config.userConfig.autoApprove, enabled: false } } }
+      : {}),
   };
 
   // Patch MCP server args to use the session-specific sandbox directory

@@ -186,7 +186,7 @@ describe('Role-agnostic rules after structural resolution', () => {
     expect(result.rule).toBe('escalate-git-clone');
   });
 
-  it('evaluates role-specific rules normally for non-filesystem servers', () => {
+  it('sandbox-resolves write-path for git_clone when URL roles present (path in sandbox)', () => {
     const policy = makePolicy([
       {
         name: 'escalate-write-path',
@@ -215,7 +215,43 @@ describe('Role-agnostic rules after structural resolution', () => {
       }),
     );
 
-    // Non-filesystem: no sandbox resolution, both roles evaluated by compiled rules.
+    // git_clone has URL roles → sandbox extension applies.
+    // write-path is sandbox-resolved (path in sandbox). Only git-remote-url evaluated.
+    // allow-urls matches git-remote-url → allow.
+    expect(result.decision).toBe('allow');
+    expect(result.rule).toBe('allow-urls');
+  });
+
+  it('evaluates both roles for git_clone when path is outside sandbox', () => {
+    const policy = makePolicy([
+      {
+        name: 'escalate-write-path',
+        description: 'Escalate writes',
+        principle: 'test',
+        if: { roles: ['write-path'] },
+        then: 'escalate',
+        reason: 'Writes need approval',
+      },
+      {
+        name: 'allow-urls',
+        description: 'Allow URLs',
+        principle: 'test',
+        if: { roles: ['git-remote-url'] },
+        then: 'allow',
+        reason: 'URLs allowed',
+      },
+    ]);
+
+    const engine = new PolicyEngine(policy, annotations, [], SANDBOX_DIR, domainAllowlists);
+    const result = engine.evaluate(
+      makeRequest({
+        serverName: 'git',
+        toolName: 'git_clone',
+        arguments: { url: 'https://github.com/user/repo.git', path: '/some/external/path' },
+      }),
+    );
+
+    // Path is outside sandbox → write-path NOT sandbox-resolved. Both roles evaluated.
     // write-path → escalate, git-remote-url → allow, most restrictive wins.
     expect(result.decision).toBe('escalate');
     expect(result.rule).toBe('escalate-write-path');
@@ -458,7 +494,7 @@ describe('Sandbox containment edge cases', () => {
     expect(result.rule).toBe('structural-sandbox-allow');
   });
 
-  it('write-history role is NOT sandbox-resolved (goes to compiled rule evaluation)', () => {
+  it('write-history role IS sandbox-resolved (agent can manipulate .git/ directly)', () => {
     const engine = new PolicyEngine(policy, annotations, [], SANDBOX_DIR);
     const result = engine.evaluate(
       makeRequest({
@@ -467,11 +503,11 @@ describe('Sandbox containment edge cases', () => {
         arguments: { path: `${SANDBOX_DIR}/repo`, mode: 'hard' },
       }),
     );
-    expect(result.decision).toBe('escalate');
-    expect(result.rule).toBe('escalate-destructive');
+    expect(result.decision).toBe('allow');
+    expect(result.rule).toBe('structural-sandbox-allow');
   });
 
-  it('delete-history role is NOT sandbox-resolved (goes to compiled rule evaluation)', () => {
+  it('delete-history role IS sandbox-resolved (agent can manipulate .git/ directly)', () => {
     const engine = new PolicyEngine(policy, annotations, [], SANDBOX_DIR);
     const result = engine.evaluate(
       makeRequest({
@@ -480,11 +516,11 @@ describe('Sandbox containment edge cases', () => {
         arguments: { path: `${SANDBOX_DIR}/repo`, name: 'old', delete: true },
       }),
     );
-    expect(result.decision).toBe('escalate');
-    expect(result.rule).toBe('escalate-destructive');
+    expect(result.decision).toBe('allow');
+    expect(result.rule).toBe('structural-sandbox-allow');
   });
 
-  it('mixed sandbox-safe and unsafe roles: safe roles resolved, unsafe go to compiled rule evaluation', () => {
+  it('all path roles sandbox-resolved when within sandbox', () => {
     const engine = new PolicyEngine(policy, annotations, [], SANDBOX_DIR);
     const result = engine.evaluate(
       makeRequest({
@@ -493,7 +529,8 @@ describe('Sandbox containment edge cases', () => {
         arguments: { path: `${SANDBOX_DIR}/repo`, mode: 'soft' },
       }),
     );
-    expect(result.decision).toBe('escalate');
+    expect(result.decision).toBe('allow');
+    expect(result.rule).toBe('structural-sandbox-allow');
   });
 
   it('tool with only opaque roles evaluates role-agnostic rules', () => {

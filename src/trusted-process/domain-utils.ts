@@ -28,18 +28,31 @@ export function isIpAddress(domain: string): boolean {
 
 /**
  * Checks whether a domain matches any pattern in an allowlist.
- * Supports exact match, `*` wildcard (matches all domain names but NOT
- * IP addresses -- SSRF structural invariant), and `*.example.com` prefix
- * wildcards (matches example.com and *.example.com).
+ *
+ * Supports hierarchical matching for git-remote-url domains that include
+ * repository paths (e.g., `github.com/owner/repo`):
+ * - `*` wildcard: matches any domain name (not IPs — SSRF structural invariant).
+ * - `*.example.com` prefix wildcard: matches hostname portion only.
+ * - Pattern without `/` (e.g., `github.com`): matches hostname portion
+ *   (any repo on that host).
+ * - Pattern with `/` (e.g., `github.com/owner/repo`): exact match only.
+ *
+ * For plain hostname domains (e.g., from `fetch-url`), behavior is unchanged.
  */
 export function domainMatchesAllowlist(domain: string, allowedDomains: readonly string[]): boolean {
+  const slashIdx = domain.indexOf('/');
+  const hostname = slashIdx >= 0 ? domain.slice(0, slashIdx) : domain;
+
   return allowedDomains.some((pattern) => {
-    if (pattern === '*') return !isIpAddress(domain);
+    if (pattern === '*') return !isIpAddress(hostname);
     if (pattern.startsWith('*.')) {
       const suffix = pattern.slice(1); // ".github.com"
-      return domain === pattern.slice(2) || domain.endsWith(suffix);
+      return hostname === pattern.slice(2) || hostname.endsWith(suffix);
     }
-    return domain === pattern;
+    // Pattern with path → exact match required
+    if (pattern.includes('/')) return domain === pattern;
+    // Pattern without path → match hostname portion
+    return hostname === pattern;
   });
 }
 
@@ -84,12 +97,44 @@ export function extractDomainForRole(value: string, role: ArgumentRole): string 
   return role === 'git-remote-url' ? extractGitDomain(value) : extractDomain(value);
 }
 
-/** Extracts the domain from a git URL (HTTP or SSH format). */
+/**
+ * Strips `.git` suffix and trailing slashes from a git repo path component.
+ * Returns empty string for root-only paths (e.g., `/` or `/.git`).
+ */
+function normalizeGitRepoPath(pathname: string): string {
+  let s = pathname;
+  if (s.startsWith('/')) s = s.slice(1);
+  if (s.endsWith('/')) s = s.slice(0, -1);
+  if (s.endsWith('.git')) s = s.slice(0, -4);
+  if (s.endsWith('/')) s = s.slice(0, -1);
+  return s;
+}
+
+/**
+ * Extracts domain information from a git URL (HTTP or SSH format).
+ * Returns `hostname/owner/repo` when a meaningful path is present,
+ * or just `hostname` otherwise.
+ *
+ * Examples:
+ * - `https://github.com/provos/ironcurtain.git` → `github.com/provos/ironcurtain`
+ * - `git@github.com:provos/ironcurtain.git` → `github.com/provos/ironcurtain`
+ * - `https://github.com/` → `github.com`
+ */
 export function extractGitDomain(value: string): string {
   // SSH format: git@host:path
-  const sshMatch = value.match(/^(?:[\w.+-]+@)?([^:]+):/);
-  if (sshMatch && !value.includes('://')) return sshMatch[1];
-  return extractDomain(value);
+  const sshMatch = value.match(/^(?:[\w.+-]+@)?([^:]+):(.*)/);
+  if (sshMatch && !value.includes('://')) {
+    const host = sshMatch[1];
+    const repoPath = normalizeGitRepoPath(sshMatch[2]);
+    return repoPath ? `${host}/${repoPath}` : host;
+  }
+  try {
+    const url = new URL(value);
+    const repoPath = normalizeGitRepoPath(url.pathname);
+    return repoPath ? `${url.hostname}/${repoPath}` : url.hostname;
+  } catch {
+    return value;
+  }
 }
 
 /**
@@ -126,5 +171,63 @@ export function resolveGitRemote(value: string, allArgs: Record<string, unknown>
     }).trim();
   } catch {
     return value; // Resolution failed -- escalation will catch it
+  }
+}
+
+/**
+ * Resolves the default remote URL for a git repository when no remote is
+ * explicitly specified in the tool call arguments.
+ *
+ * Resolution order:
+ *   1. The tracking remote for the current branch:
+ *      `git rev-parse --abbrev-ref --symbolic-full-name @{u}` yields
+ *      "refs/remotes/<remote>/<branch>" (or "<remote>/<branch>" in short form).
+ *      The remote name is extracted and resolved via `git remote get-url`.
+ *   2. Fallback: `git remote get-url origin`.
+ *
+ * Returns undefined when resolution fails for any reason (not a git repo,
+ * no remotes configured, git not installed, timeout). Callers treat undefined
+ * as "no enrichment possible" and pass the original request through unchanged.
+ *
+ * Uses execFileSync (not execSync) throughout to avoid command injection.
+ */
+export function resolveDefaultGitRemote(repoPath: string): string | undefined {
+  const resolved = resolve(repoPath);
+  const execOpts: Parameters<typeof execFileSync>[2] & { encoding: 'utf-8' } = {
+    cwd: resolved,
+    encoding: 'utf-8',
+    timeout: 5000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  };
+
+  // Step 1: resolve via the current branch's configured tracking remote.
+  // Read branch.<name>.remote from git config directly — this works even when
+  // the remote has never been fetched (no remote-tracking refs needed).
+  try {
+    const branch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], execOpts).trim();
+    if (branch && branch !== 'HEAD') {
+      // git config returns exit 1 when the key is absent — caught below
+      try {
+        const remoteName = execFileSync('git', ['config', '--get', `branch.${branch}.remote`], execOpts).trim();
+        if (remoteName) {
+          try {
+            return execFileSync('git', ['remote', 'get-url', remoteName], execOpts).trim();
+          } catch {
+            // remote name configured but deleted — fall through to origin fallback
+          }
+        }
+      } catch {
+        // No tracking remote configured for this branch
+      }
+    }
+  } catch {
+    // Not a git repo or detached HEAD — fall through to origin fallback
+  }
+
+  // Step 2: fallback to 'origin'.
+  try {
+    return execFileSync('git', ['remote', 'get-url', 'origin'], execOpts).trim();
+  } catch {
+    return undefined; // No origin configured or not a git repo
   }
 }

@@ -38,6 +38,7 @@ export type ArgumentRole =
   | 'git-remote-url'
   // Identifier roles (case-insensitive allowlist-checked identifiers)
   | 'github-owner'
+  | 'github-repo'
   // Opaque roles (semantic meaning but not resource identifiers)
   | 'branch-name'
   | 'commit-message'
@@ -237,6 +238,20 @@ const registryEntries: [ArgumentRole, RoleDefinition][] = [
     },
   ],
   [
+    'github-repo',
+    {
+      description: 'GitHub repository name (without owner prefix)',
+      isResourceIdentifier: true,
+      category: 'identifier',
+      canonicalize: lowercase,
+      annotationGuidance:
+        'Assign to arguments that identify a GitHub repository name (without the owner prefix). ' +
+        'Typically the "repo" parameter on GitHub API tools. ' +
+        'Always pair with the corresponding github-owner argument.',
+      serverNames: ['github'],
+    },
+  ],
+  [
     'branch-name',
     {
       description: 'Git branch name',
@@ -291,6 +306,7 @@ const _ROLE_COMPLETENESS_CHECK: Record<ArgumentRole, true> = {
   'fetch-url': true,
   'git-remote-url': true,
   'github-owner': true,
+  'github-repo': true,
   'branch-name': true,
   'commit-message': true,
   none: true,
@@ -376,7 +392,13 @@ export function getIdentifierRoles(): ArgumentRole[] {
  * serverNames including 'filesystem', the fast path must be updated
  * to check for those roles before auto-allowing.
  */
-export const SANDBOX_SAFE_PATH_ROLES: ReadonlySet<ArgumentRole> = new Set(['read-path', 'write-path', 'delete-path']);
+export const SANDBOX_SAFE_PATH_ROLES: ReadonlySet<ArgumentRole> = new Set([
+  'read-path',
+  'write-path',
+  'delete-path',
+  'write-history',
+  'delete-history',
+]);
 
 // ---------------------------------------------------------------------------
 // Conditional Role Resolution
@@ -387,7 +409,9 @@ import type {
   ConditionalRoles,
   RoleCondition,
   StoredToolAnnotation,
+  StoredToolAnnotationsFile,
   ToolAnnotation,
+  ToolAnnotationsFile,
 } from '../pipeline/types.js';
 
 /** Type guard: returns true if an ArgumentRoleSpec is a conditional block. */
@@ -435,6 +459,36 @@ export function resolveStoredAnnotation(
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const { args: _rawArgs, ...rest } = stored;
   return { ...rest, args: resolvedArgs };
+}
+
+/**
+ * Resolves an entire StoredToolAnnotationsFile to a plain ToolAnnotationsFile
+ * by flattening all conditional role specs to their default roles.
+ *
+ * This is the correct entry point for the policy compilation pipeline, which
+ * never has actual call arguments and should only see the flat ToolAnnotation
+ * shape. The policy engine resolves conditionals at evaluation time instead.
+ */
+export function resolveStoredAnnotationsFile(stored: StoredToolAnnotationsFile): ToolAnnotationsFile {
+  return {
+    ...stored,
+    servers: Object.fromEntries(
+      Object.entries(stored.servers).map(([serverName, server]) => [
+        serverName,
+        {
+          ...server,
+          tools: server.tools.map((tool) => {
+            const resolvedArgs: Record<string, ArgumentRole[]> = {};
+            for (const [argName, spec] of Object.entries(tool.args)) {
+              resolvedArgs[argName] = extractDefaultRoles(spec);
+            }
+            const { args: _rawArgs, ...rest } = tool; // eslint-disable-line @typescript-eslint/no-unused-vars
+            return { ...rest, args: resolvedArgs };
+          }),
+        },
+      ]),
+    ),
+  };
 }
 
 /**

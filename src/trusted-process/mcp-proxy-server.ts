@@ -76,6 +76,7 @@ import { permissiveJsonSchemaValidator } from './permissive-output-validator.js'
 import type { LanguageModelV3 } from '@ai-sdk/provider';
 import type { MCPServerConfig, SandboxAvailabilityPolicy } from '../config/types.js';
 import { VERSION } from '../version.js';
+import { loadToolDescriptionHints, applyToolDescriptionHints } from './tool-description-hints.js';
 
 export interface ProxiedTool {
   serverName: string;
@@ -305,6 +306,8 @@ export interface ProxyEnvConfig {
   auditLogPath: string;
   serversConfig: Record<string, MCPServerConfig>;
   generatedDir: string;
+  /** Directory for tool-annotations.json. Defaults to generatedDir if unset. */
+  toolAnnotationsDir: string;
   protectedPaths: string[];
   sessionLogPath: string | undefined;
   allowedDirectory: string | undefined;
@@ -390,10 +393,15 @@ export function parseProxyEnvConfig(): ProxyEnvConfig {
     process.exit(1);
   }
 
+  // When TOOL_ANNOTATIONS_DIR is set, annotations come from there.
+  // Otherwise they default to the same directory as compiled policy.
+  const toolAnnotationsDir = process.env.TOOL_ANNOTATIONS_DIR ?? generatedDir;
+
   return {
     auditLogPath,
     serversConfig,
     generatedDir,
+    toolAnnotationsDir,
     protectedPaths,
     sessionLogPath,
     allowedDirectory,
@@ -553,8 +561,46 @@ export async function handleCallTool(
       isError: true,
     };
   }
+
+  // Enrich git tool args with the locally tracked working directory when
+  // the agent omits the `path` argument. The git MCP server tracks its own
+  // CWD (set via git_set_working_dir) and uses it implicitly, but the
+  // policy engine needs the explicit path to resolve sandbox containment
+  // and the default remote URL for domain-based policy rules.
+  // The serverContextMap mirrors the git server's working directory from
+  // successful git_set_working_dir / git_clone calls, avoiding an RPC.
+  let effectiveRawArgs = rawArgs;
+  const hasEffectivePath = 'path' in rawArgs && typeof rawArgs.path === 'string' && rawArgs.path.trim() !== '';
+  if (toolInfo.serverName === 'git' && 'path' in annotation.args && !hasEffectivePath) {
+    const gitWorkDir = deps.serverContextMap.get('git')?.workingDirectory;
+    if (!gitWorkDir) {
+      const errorMsg = 'Git server has no working directory set. Call git_set_working_dir first.';
+      deps.auditLog.log(
+        buildAuditEntry(
+          {
+            requestId: uuidv4(),
+            serverName: toolInfo.serverName,
+            toolName: toolInfo.name,
+            arguments: rawArgs,
+            timestamp: new Date().toISOString(),
+          },
+          rawArgs,
+          { status: 'deny', rule: 'git-path-enrichment-failed', reason: errorMsg },
+          { status: 'denied', error: errorMsg },
+          0,
+          {},
+        ),
+      );
+      return {
+        content: [{ type: 'text', text: `Error: ${errorMsg}` }],
+        isError: true,
+      };
+    }
+    effectiveRawArgs = { ...rawArgs, path: gitWorkDir };
+  }
+
   const { argsForTransport, argsForPolicy } = prepareToolArgs(
-    rawArgs,
+    effectiveRawArgs,
     annotation,
     deps.allowedDirectory,
     CONTAINER_WORKSPACE_DIR,
@@ -797,6 +843,7 @@ async function main(): Promise<void> {
     auditLogPath,
     serversConfig,
     generatedDir,
+    toolAnnotationsDir,
     protectedPaths,
     sessionLogPath,
     allowedDirectory,
@@ -806,7 +853,11 @@ async function main(): Promise<void> {
     auditRedaction,
   } = envConfig;
 
-  const { compiledPolicy, toolAnnotations, dynamicLists } = loadGeneratedPolicy(generatedDir, getPackageGeneratedDir());
+  const { compiledPolicy, toolAnnotations, dynamicLists } = loadGeneratedPolicy({
+    policyDir: generatedDir,
+    toolAnnotationsDir,
+    fallbackDir: getPackageGeneratedDir(),
+  });
 
   const serverDomainAllowlists = extractServerDomainAllowlists(serversConfig);
   const policyEngine = new PolicyEngine(
@@ -921,20 +972,21 @@ async function main(): Promise<void> {
   }
 
   const toolMap = buildToolMap(allTools);
+  const toolDescriptionHints = loadToolDescriptionHints();
+  const hintedTools = applyToolDescriptionHints(allTools, toolDescriptionHints);
+  const listToolsResponse = {
+    tools: hintedTools.map((t) => ({
+      name: t.name,
+      description: t.description,
+      inputSchema: t.inputSchema,
+    })),
+  };
 
   // ── Create the proxy MCP server ───────────────────────────────────
   // eslint-disable-next-line @typescript-eslint/no-deprecated -- intentional use of low-level Server for raw JSON schema passthrough
   const server = new Server({ name: 'ironcurtain-proxy', version: VERSION }, { capabilities: { tools: {} } });
 
-  server.setRequestHandler(ListToolsRequestSchema, () => {
-    return {
-      tools: allTools.map((t) => ({
-        name: t.name,
-        description: t.description,
-        inputSchema: t.inputSchema,
-      })),
-    };
-  });
+  server.setRequestHandler(ListToolsRequestSchema, () => listToolsResponse);
 
   const serverContextMap: ServerContextMap = new Map();
 

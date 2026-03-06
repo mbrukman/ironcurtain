@@ -31,8 +31,8 @@ import {
 } from '../src/trusted-process/domain-utils.js';
 
 describe('ARGUMENT_ROLE_REGISTRY', () => {
-  it('contains all eleven roles', () => {
-    expect(ARGUMENT_ROLE_REGISTRY.size).toBe(11);
+  it('contains all twelve roles', () => {
+    expect(ARGUMENT_ROLE_REGISTRY.size).toBe(12);
   });
 
   it('has entries for all known roles', () => {
@@ -45,6 +45,7 @@ describe('ARGUMENT_ROLE_REGISTRY', () => {
       'fetch-url',
       'git-remote-url',
       'github-owner',
+      'github-repo',
       'branch-name',
       'commit-message',
       'none',
@@ -106,8 +107,8 @@ describe('getResourceRoles', () => {
     expect(roles).not.toContain('commit-message');
   });
 
-  it('returns exactly eight roles', () => {
-    expect(getResourceRoles()).toHaveLength(8);
+  it('returns exactly nine roles', () => {
+    expect(getResourceRoles()).toHaveLength(9);
   });
 });
 
@@ -139,7 +140,7 @@ describe('getArgumentRoleValues', () => {
     expect(values.length).toBeGreaterThanOrEqual(1);
   });
 
-  it('contains all eleven roles', () => {
+  it('contains all twelve roles', () => {
     const values = getArgumentRoleValues();
     expect(values).toContain('read-path');
     expect(values).toContain('write-path');
@@ -149,6 +150,7 @@ describe('getArgumentRoleValues', () => {
     expect(values).toContain('fetch-url');
     expect(values).toContain('git-remote-url');
     expect(values).toContain('github-owner');
+    expect(values).toContain('github-repo');
     expect(values).toContain('branch-name');
     expect(values).toContain('commit-message');
     expect(values).toContain('none');
@@ -301,21 +303,26 @@ describe('extractDomainForRole', () => {
   });
 
   it('uses extractGitDomain for git-remote-url with SSH URL', () => {
-    expect(extractDomainForRole('git@github.com:user/repo.git', 'git-remote-url')).toBe('github.com');
+    expect(extractDomainForRole('git@github.com:user/repo.git', 'git-remote-url')).toBe('github.com/user/repo');
   });
 
   it('uses extractGitDomain for git-remote-url with HTTPS URL', () => {
-    expect(extractDomainForRole('https://gitlab.com/user/repo.git', 'git-remote-url')).toBe('gitlab.com');
+    expect(extractDomainForRole('https://gitlab.com/user/repo.git', 'git-remote-url')).toBe('gitlab.com/user/repo');
   });
 });
 
 describe('extractGitDomain', () => {
-  it('extracts domain from SSH URL', () => {
-    expect(extractGitDomain('git@github.com:user/repo.git')).toBe('github.com');
+  it('extracts hostname/owner/repo from SSH URL', () => {
+    expect(extractGitDomain('git@github.com:user/repo.git')).toBe('github.com/user/repo');
   });
 
-  it('extracts domain from HTTPS URL', () => {
-    expect(extractGitDomain('https://gitlab.com/user/repo.git')).toBe('gitlab.com');
+  it('extracts hostname/owner/repo from HTTPS URL', () => {
+    expect(extractGitDomain('https://gitlab.com/user/repo.git')).toBe('gitlab.com/user/repo');
+  });
+
+  it('returns hostname only when no repo path (HTTPS)', () => {
+    expect(extractGitDomain('https://github.com/')).toBe('github.com');
+    expect(extractGitDomain('https://github.com')).toBe('github.com');
   });
 
   it('returns named remote as-is (not a URL)', () => {

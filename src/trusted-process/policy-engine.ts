@@ -34,7 +34,13 @@ import {
   SANDBOX_SAFE_PATH_ROLES,
   type RoleDefinition,
 } from '../types/argument-roles.js';
-import { domainMatchesAllowlist, isIpAddress, resolveGitRemote, extractDomainForRole } from './domain-utils.js';
+import {
+  domainMatchesAllowlist,
+  isIpAddress,
+  resolveGitRemote,
+  resolveDefaultGitRemote,
+  extractDomainForRole,
+} from './domain-utils.js';
 import { getListMatcher } from '../pipeline/dynamic-list-types.js';
 
 /**
@@ -379,12 +385,75 @@ export class PolicyEngine {
     // After this point, `annotation` has the standard shape: args: Record<string, ArgumentRole[]>
     const annotation = this.getAnnotation(request.serverName, request.toolName, request.arguments);
 
-    // Structural checks (may resolve some roles via sandbox containment)
+    // Structural checks first (protected-path deny, sandbox containment).
+    // Git enrichment runs AFTER structural invariants so that protected-path
+    // checks and sandbox containment are evaluated on the raw request before
+    // any filesystem access (git config reads) occurs.
     const structural = this.evaluateStructuralInvariants(request, annotation);
     if (structural.decision) return structural.decision;
 
+    // Git remote enrichment: when a git push/pull/fetch omits the remote arg,
+    // resolve the repo's configured default remote URL from the filesystem so
+    // the domain gate and compiled domains conditions can evaluate it.
+    // Safe to run now: structural checks have confirmed paths are within sandbox.
+    const effectiveRequest = this.enrichGitRequest(request, annotation);
+
     // Compiled rule evaluation (skipping sandbox-resolved roles)
-    return this.evaluateCompiledRules(request, structural.sandboxResolvedRoles, annotation);
+    return this.evaluateCompiledRules(effectiveRequest, structural.sandboxResolvedRoles, annotation);
+  }
+
+  /**
+   * Enriches a git tool call by resolving absent git-remote-url arguments
+   * to the repository's default remote URL.
+   *
+   * When an agent calls git_push/git_pull/git_fetch without an explicit
+   * remote, git uses the branch's configured upstream (or 'origin'). This
+   * method makes that implicit remote explicit so URL-aware policy checks
+   * (the structural domain gate and compiled domains conditions) fire correctly.
+   *
+   * Only applies to the 'git' server. No-ops when the remote arg is already
+   * present, when resolution fails, or when there is no annotation.
+   */
+  private enrichGitRequest(request: ToolCallRequest, annotation: ToolAnnotation | undefined): ToolCallRequest {
+    if (request.serverName !== 'git' || !annotation) return request;
+
+    // Collect git-remote-url annotated args whose value is absent or empty.
+    const missingUrlArgNames: string[] = [];
+    for (const [argName, roles] of Object.entries(annotation.args)) {
+      if (!roles.includes('git-remote-url')) continue;
+      const value = request.arguments[argName];
+      const isAbsent = !(argName in request.arguments) || value === null || value === undefined || value === '';
+      if (isAbsent) missingUrlArgNames.push(argName);
+    }
+
+    if (missingUrlArgNames.length === 0) return request;
+
+    // Only attempt enrichment when a valid path is provided. Falling back to
+    // '.' would resolve the default remote from the trusted process working
+    // directory, which may point at an unrelated repository.
+    if (typeof request.arguments.path !== 'string') return request;
+
+    // Gate on sandbox containment: only read git config from repos inside the
+    // allowed directory. Without this, an attacker-controlled path could trigger
+    // filesystem reads from arbitrary locations in the trusted process.
+    if (this.allowedDirectory) {
+      try {
+        const realPath = resolveRealPath(request.arguments.path);
+        if (!isWithinDirectory(realPath, this.allowedDirectory)) return request;
+      } catch {
+        return request; // path doesn't exist or can't be resolved
+      }
+    }
+
+    const resolvedUrl = resolveDefaultGitRemote(request.arguments.path);
+
+    if (resolvedUrl === undefined) return request;
+
+    const enrichedArgs = { ...request.arguments };
+    for (const argName of missingUrlArgNames) {
+      enrichedArgs[argName] = resolvedUrl;
+    }
+    return { ...request, arguments: enrichedArgs };
   }
 
   /**
@@ -452,11 +521,19 @@ export class PolicyEngine {
     // Heuristic paths are only used for defense-in-depth on the deny side
     // (protected path check).
     //
-    // Only SANDBOX_SAFE_PATH_ROLES (read-path, write-path, delete-path) can
-    // be auto-resolved by sandbox containment. Higher-risk path roles like
-    // write-history and delete-history always fall through to compiled rule evaluation.
+    // Only SANDBOX_SAFE_PATH_ROLES (read-path, write-path, delete-path,
+    // write-history, delete-history) can be auto-resolved by sandbox containment.
+    // Rationale: if the agent can freely read/write/delete files in the sandbox,
+    // it can already manipulate .git/ contents directly, so history roles within
+    // the sandbox add no additional risk.
     const sandboxResolvedRoles = new Set<ArgumentRole>();
-    const resolvedSandboxPaths = annotation ? annotatedPaths.map((p) => resolveRealPath(p)) : resolvedPaths;
+    // Reuse already-resolved paths when annotated paths are a subset of allPaths
+    const resolvedSandboxPaths = annotation
+      ? annotatedPaths.map((p) => {
+          const idx = allPaths.indexOf(p);
+          return idx !== -1 ? resolvedPaths[idx] : resolveRealPath(p);
+        })
+      : resolvedPaths;
 
     // Extract URL args once for use in both sandbox containment (fast-path guard) and untrusted domain gate
     const urlArgs = annotation ? extractAnnotatedUrls(request.arguments, annotation, getUrlRoles()) : [];
@@ -472,16 +549,15 @@ export class PolicyEngine {
 
     if (this.allowedDirectory && resolvedSandboxPaths.length > 0) {
       const sandboxDir = this.allowedDirectory;
-
-      // Sandbox containment is only a structural allow for filesystem operations.
-      // For other servers, paths are locators (e.g. "which repo dir") — the
-      // operation itself needs compiled-rule evaluation regardless of path location.
       const isFilesystem = request.serverName === 'filesystem';
-
-      // Fast path: all annotated paths within sandbox -> auto-allow (filesystem only)
-      // Only fires when ALL path roles are sandbox-safe and no URL roles need checking
+      const isGit = request.serverName === 'git';
       const allWithinSandbox = resolvedSandboxPaths.every((rp) => isWithinDirectory(rp, sandboxDir));
 
+      // Fast path: all paths within sandbox, all roles sandbox-safe, no URL roles
+      // → auto-allow without compiled rule evaluation.
+      // Applies only to the filesystem server. Git operations can have
+      // non-filesystem side effects (e.g., network, credentials), so they must
+      // always pass through compiled-rule evaluation.
       if (isFilesystem && allWithinSandbox && urlArgs.length === 0 && !toolHasUnsafePathRoles) {
         return finalDecision({
           decision: 'allow',
@@ -490,11 +566,15 @@ export class PolicyEngine {
         });
       }
 
-      // Partial sandbox resolution (filesystem only): check each path role
-      // independently. A role is "sandbox-resolved" if every path for that
-      // role is within the sandbox. Only sandbox-safe roles can be resolved.
-      // Roles with zero extracted paths are not resolved.
-      if (isFilesystem && annotation) {
+      // Partial sandbox resolution: check each path role independently.
+      // A role is "sandbox-resolved" if every path for that role is within the
+      // sandbox, removing it from compiled-rule evaluation. Remaining roles
+      // (e.g., git-remote-url) still run through compiled rules.
+      //
+      // Applied to filesystem and git. For git tools with URL roles
+      // (e.g., git_clone with write-path + git-remote-url), the path role is
+      // sandbox-resolved while the URL role goes to compiled rules independently.
+      if ((isFilesystem || isGit) && annotation) {
         for (const role of pathRoles) {
           if (!SANDBOX_SAFE_PATH_ROLES.has(role)) continue;
           const pathsForRole = extractAnnotatedPaths(request.arguments, annotation, [role]);
@@ -525,7 +605,21 @@ export class PolicyEngine {
         // to block structurally." URL roles are NOT marked as resolved;
         // compiled rules still evaluate the operation (e.g. "escalate all git push").
       }
-      // If no allowlist, URL roles are not structurally restricted -- fall through to compiled rule evaluation
+      // KNOWN GAP: when no allowlist is configured for a server (e.g. the git
+      // server's allowedDomains is currently disabled — see mcp-servers.json
+      // _comment — due to a Linux SSH/sandbox-runtime limitation), the
+      // structural domain gate does not fire. In that case, compiled "allow"
+      // rules without a URL/domain constraint (e.g. allow-git-push-default-remote,
+      // allow-git-fetch-no-remote) will match even when an explicit unauthorized
+      // remote URL is supplied, because the rule was designed as a no-remote
+      // fallback but has no condition to distinguish the two cases.
+      //
+      // The correct long-term fix is Option A (skip no-constraint allow rules
+      // when concrete URL values are present during URL-role evaluation).
+      // Option C (structural gate) is the intended primary defense here, but
+      // requires allowedDomains to be configured. Until the sandbox-runtime
+      // SSH issue is resolved and allowedDomains can be re-enabled for the git
+      // server, this gap exists. See Issue 2 in the policy engine design notes.
     }
 
     // Unknown tool denial
@@ -793,7 +887,12 @@ export class PolicyEngine {
     // Check lists conditions (non-domain list matching)
     if (cond.lists !== undefined) {
       for (const listCond of cond.lists) {
-        const extractRoles = evaluatingRole ? [evaluatingRole] : listCond.roles;
+        // Scope extraction to the evaluating role only when this list condition
+        // targets that role. Otherwise use the condition's own roles — this is
+        // necessary for multi-identifier rules (e.g. github-owner + github-repo)
+        // where each list condition targets a different role.
+        const extractRoles =
+          evaluatingRole && listCond.roles.includes(evaluatingRole) ? [evaluatingRole] : listCond.roles;
         const extractedValues = extractAnnotatedPaths(request.arguments, annotation, extractRoles);
 
         // Zero values extracted = condition not satisfied, rule does not match

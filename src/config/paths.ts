@@ -221,3 +221,71 @@ export function computeConstitutionHash(basePath: string): string {
   const text = loadConstitutionText(basePath);
   return createHash('sha256').update(text).digest('hex');
 }
+
+// ---------------------------------------------------------------------------
+// Daemon control socket
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns the daemon control socket path: {home}/daemon.sock
+ *
+ * The daemon listens on this Unix domain socket so CLI commands
+ * can communicate with a running daemon (e.g., add-job, run-job).
+ */
+export function getDaemonSocketPath(): string {
+  return resolve(getIronCurtainHome(), 'daemon.sock');
+}
+
+// ---------------------------------------------------------------------------
+// Job paths (cron mode)
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns the jobs base directory: {home}/jobs/
+ */
+export function getJobsDir(): string {
+  return resolve(getIronCurtainHome(), 'jobs');
+}
+
+import { JOB_ID_PATTERN } from '../cron/types.js';
+
+/**
+ * Validates that a job ID contains only safe characters.
+ */
+function validateJobId(jobId: string): void {
+  if (!JOB_ID_PATTERN.test(jobId)) {
+    throw new Error(`Invalid job ID: ${jobId}`);
+  }
+}
+
+/**
+ * Returns the directory for a specific job: {home}/jobs/{jobId}/
+ */
+export function getJobDir(jobId: string): string {
+  validateJobId(jobId);
+  return resolve(getJobsDir(), jobId);
+}
+
+/**
+ * Returns the generated artifacts directory for a job:
+ * {home}/jobs/{jobId}/generated/
+ */
+export function getJobGeneratedDir(jobId: string): string {
+  return resolve(getJobDir(jobId), 'generated');
+}
+
+/**
+ * Returns the workspace directory for a job:
+ * {home}/jobs/{jobId}/workspace/
+ */
+export function getJobWorkspaceDir(jobId: string): string {
+  return resolve(getJobDir(jobId), 'workspace');
+}
+
+/**
+ * Returns the runs directory for a job:
+ * {home}/jobs/{jobId}/runs/
+ */
+export function getJobRunsDir(jobId: string): string {
+  return resolve(getJobDir(jobId), 'runs');
+}

@@ -7,7 +7,7 @@
  */
 
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { LanguageModel } from 'ai';
@@ -19,9 +19,16 @@ import { createLanguageModel } from '../config/model-provider.js';
 import { getIronCurtainHome, getUserGeneratedDir, loadConstitutionText } from '../config/paths.js';
 
 // Re-export so existing pipeline callers (loadPipelineConfig) don't need updating.
-export { loadConstitutionText } from '../config/paths.js';
 import type { MCPServerConfig } from '../config/types.js';
 import { loadUserConfig } from '../config/user-config.js';
+import type {
+  CompiledRule,
+  DiscardedScenario,
+  TestScenario,
+  ToolAnnotationsFile,
+  StoredToolAnnotationsFile,
+} from './types.js';
+import { resolveRealPath, resolveStoredAnnotationsFile } from '../types/argument-roles.js';
 import { createLlmLoggingMiddleware, type LlmLogContext } from './llm-logger.js';
 import { createCacheStrategy, type PromptCacheStrategy } from '../session/prompt-cache.js';
 
@@ -34,7 +41,6 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 export interface PipelineConfig {
   constitutionPath: string;
   constitutionText: string;
-  constitutionHash: string;
   mcpServers: Record<string, MCPServerConfig>;
   generatedDir: string; // write target (user-local)
   packageGeneratedDir: string; // fallback for reads (package-bundled)
@@ -46,7 +52,6 @@ export function loadPipelineConfig(): PipelineConfig {
   const configDir = resolve(__dirname, '..', 'config');
   const constitutionPath = resolve(configDir, 'constitution.md');
   const constitutionText = loadConstitutionText(constitutionPath);
-  const constitutionHash = createHash('sha256').update(constitutionText).digest('hex');
   const mcpServersPath = resolve(configDir, 'mcp-servers.json');
   const mcpServers = JSON.parse(readFileSync(mcpServersPath, 'utf-8')) as Record<string, MCPServerConfig>;
   resolveMcpServerPaths(mcpServers);
@@ -80,7 +85,6 @@ export function loadPipelineConfig(): PipelineConfig {
   return {
     constitutionPath,
     constitutionText,
-    constitutionHash,
     mcpServers,
     generatedDir,
     packageGeneratedDir,
@@ -108,15 +112,28 @@ export function loadExistingArtifact<T>(generatedDir: string, filename: string, 
     candidates.push(resolve(fallbackDir, filename));
   }
   for (const path of candidates) {
-    if (existsSync(path)) {
-      try {
-        return JSON.parse(readFileSync(path, 'utf-8')) as T;
-      } catch {
-        // Corrupt file -- try next candidate
-      }
+    try {
+      return JSON.parse(readFileSync(path, 'utf-8')) as T;
+    } catch {
+      // File missing or corrupt -- try next candidate
     }
   }
   return undefined;
+}
+
+/**
+ * Loads tool-annotations.json, resolving any conditional role specs to their
+ * default roles so the pipeline always sees the flat ToolAnnotationsFile shape.
+ *
+ * This is the single entry point for the compilation pipeline. Only the
+ * annotator (which writes the file) and the policy engine (which resolves
+ * conditionals at evaluation time against actual call args) need to know
+ * about StoredToolAnnotationsFile.
+ */
+export function loadToolAnnotationsFile(dir: string, fallbackDir?: string): ToolAnnotationsFile | undefined {
+  const stored = loadExistingArtifact<StoredToolAnnotationsFile>(dir, 'tool-annotations.json', fallbackDir);
+  if (!stored) return undefined;
+  return resolveStoredAnnotationsFile(stored);
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +178,63 @@ export async function withSpinner<T>(
 export function writeArtifact(generatedDir: string, filename: string, data: unknown): void {
   mkdirSync(generatedDir, { recursive: true });
   writeFileSync(resolve(generatedDir, filename), JSON.stringify(data, null, 2) + '\n');
+}
+
+// ---------------------------------------------------------------------------
+// Rule Path Resolution
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolves all `paths.within` values in compiled rules to their real
+ * filesystem paths, following symlinks. This ensures that symlinked
+ * directories (e.g., ~/Downloads -> /mnt/c/.../Downloads on WSL) are
+ * resolved to their canonical form so that runtime path comparisons
+ * match correctly.
+ *
+ * Falls back to path.resolve() if the path does not exist on disk.
+ */
+export function resolveRulePaths(rules: CompiledRule[]): CompiledRule[] {
+  return rules.map((rule) => {
+    if (!rule.if.paths?.within) return rule;
+
+    const resolved = resolveRealPath(rule.if.paths.within);
+    if (resolved === rule.if.paths.within) return rule;
+
+    return {
+      ...rule,
+      if: {
+        ...rule.if,
+        paths: { ...rule.if.paths, within: resolved },
+      },
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Scenario Merge
+// ---------------------------------------------------------------------------
+
+/**
+ * Merges replacement scenarios from the regeneration session into the
+ * scenario list. Removes corrected and discarded scenarios, then adds
+ * unique replacements that don't duplicate any remaining scenario.
+ */
+export function mergeReplacements(
+  scenarios: TestScenario[],
+  replacements: TestScenario[],
+  corrections: ReadonlyArray<{ scenarioDescription: string }>,
+  discardedScenarios: ReadonlyArray<DiscardedScenario>,
+): TestScenario[] {
+  const removedDescriptions = new Set([
+    ...corrections.map((c) => c.scenarioDescription),
+    ...discardedScenarios.filter((d) => d.scenario.source !== 'handwritten').map((d) => d.scenario.description),
+  ]);
+
+  const kept = scenarios.filter((s) => !removedDescriptions.has(s.description));
+  const keptDescriptions = new Set(kept.map((s) => s.description));
+  const uniqueReplacements = replacements.filter((r) => !keptDescriptions.has(r.description));
+
+  return [...kept, ...uniqueReplacements];
 }
 
 // ---------------------------------------------------------------------------

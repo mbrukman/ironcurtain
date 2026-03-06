@@ -1,5 +1,7 @@
 import { homedir } from 'node:os';
-import { describe, it, expect } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, realpathSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import type { CompiledPolicyFile, ToolAnnotationsFile, StoredToolAnnotationsFile } from '../src/pipeline/types.js';
 import { PolicyEngine, domainMatchesAllowlist, isIpAddress } from '../src/trusted-process/policy-engine.js';
 import { extractServerDomainAllowlists } from '../src/config/index.js';
@@ -827,6 +829,35 @@ describe('PolicyEngine', () => {
     it('non-matching explicit IP does not match', () => {
       expect(domainMatchesAllowlist('10.0.0.1', ['192.168.1.100'])).toBe(false);
     });
+
+    // Hierarchical matching for git-remote-url domains (hostname/owner/repo)
+    it('hostname-only pattern matches domain with repo path', () => {
+      expect(domainMatchesAllowlist('github.com/provos/ironcurtain', ['github.com'])).toBe(true);
+    });
+
+    it('exact repo pattern matches same repo', () => {
+      expect(domainMatchesAllowlist('github.com/provos/ironcurtain', ['github.com/provos/ironcurtain'])).toBe(true);
+    });
+
+    it('exact repo pattern does not match different repo', () => {
+      expect(domainMatchesAllowlist('github.com/provos/ironcurtain', ['github.com/other/repo'])).toBe(false);
+    });
+
+    it('wildcard * matches domain with repo path', () => {
+      expect(domainMatchesAllowlist('github.com/provos/ironcurtain', ['*'])).toBe(true);
+    });
+
+    it('wildcard * does not match IP with repo path', () => {
+      expect(domainMatchesAllowlist('192.168.1.1/provos/repo', ['*'])).toBe(false);
+    });
+
+    it('prefix wildcard matches domain with repo path (hostname portion)', () => {
+      expect(domainMatchesAllowlist('api.github.com/provos/repo', ['*.github.com'])).toBe(true);
+    });
+
+    it('hostname-only pattern does not match different host with repo path', () => {
+      expect(domainMatchesAllowlist('gitlab.com/provos/ironcurtain', ['github.com'])).toBe(false);
+    });
   });
 
   describe('isIpAddress', () => {
@@ -997,8 +1028,8 @@ describe('PolicyEngine', () => {
           arguments: { url: 'https://github.com/user/repo.git', path: `${SANDBOX_DIR}/repo` },
         }),
       );
-      // Domain passes structural check, but sandbox-allow is filesystem-only
-      // and domain check is reject-only. Roles go to compiled rule evaluation → escalate-git-clone.
+      // Domain passes structural check. write-path is sandbox-resolved (path in SANDBOX_DIR).
+      // git-remote-url goes to compiled rule evaluation → escalate-git-clone.
       expect(result.decision).toBe('escalate');
       expect(result.rule).toBe('escalate-git-clone');
     });
@@ -1048,6 +1079,44 @@ describe('PolicyEngine', () => {
       expect(result.rule).not.toBe('structural-domain-escalate');
     });
 
+    it('sandbox-resolves write-path for git_clone when URL roles are present (Issue 3)', () => {
+      // git_clone has both write-path and git-remote-url. When path is inside
+      // the sandbox, write-path is structurally resolved. Only git-remote-url
+      // then runs through compiled rules — so a URL-allow rule can permit the clone
+      // without the path role forcing re-evaluation.
+      const allowClonePolicy: CompiledPolicyFile = {
+        generatedAt: 'test',
+        constitutionHash: 'test',
+        inputHash: 'test',
+        rules: [
+          {
+            name: 'allow-git-clone-github',
+            description: 'Allow cloning from GitHub',
+            principle: 'Least privilege',
+            if: {
+              server: ['git'],
+              tool: ['git_clone'],
+              domains: { roles: ['git-remote-url'], allowed: ['github.com'] },
+            },
+            then: 'allow',
+            reason: 'GitHub is trusted for cloning',
+          },
+        ],
+      };
+      const cloneEngine = new PolicyEngine(allowClonePolicy, gitAnnotations, [], SANDBOX_DIR);
+
+      const result = cloneEngine.evaluate(
+        makeRequest({
+          serverName: 'git',
+          toolName: 'git_clone',
+          arguments: { url: 'https://github.com/user/repo.git', path: `${SANDBOX_DIR}/repo` },
+        }),
+      );
+      // write-path is sandbox-resolved (path in sandbox); git-remote-url → allow-git-clone-github
+      expect(result.decision).toBe('allow');
+      expect(result.rule).toBe('allow-git-clone-github');
+    });
+
     it('handles SSH git URLs in domain check', () => {
       const allowlists = new Map([['git', ['github.com', '*.github.com']]]);
       const gitEngine = new PolicyEngine(gitPolicy, gitAnnotations, [], SANDBOX_DIR, allowlists);
@@ -1075,10 +1144,441 @@ describe('PolicyEngine', () => {
         }),
       );
       // git_status has only read-path args, no URL args → untrusted domain gate skipped.
-      // Sandbox structural allow is filesystem-only, so git falls through
-      // to compiled rules where allow-git-read matches.
+      // All paths within sandbox → structural-sandbox-allow.
       expect(result.decision).toBe('allow');
-      expect(result.rule).toBe('allow-git-read');
+      expect(result.rule).toBe('structural-sandbox-allow');
+    });
+  });
+
+  describe('Repo-level domain matching in compiled rules', () => {
+    const gitAnnotations: ToolAnnotationsFile = {
+      generatedAt: 'test',
+      servers: {
+        git: {
+          inputHash: 'test',
+          tools: [
+            {
+              toolName: 'git_clone',
+              serverName: 'git',
+              comment: 'Clone a repository',
+              sideEffects: true,
+              args: { url: ['git-remote-url'], path: ['write-path'] },
+            },
+          ],
+        },
+      },
+    };
+
+    const repoPolicy: CompiledPolicyFile = {
+      generatedAt: 'test',
+      constitutionHash: 'test',
+      inputHash: 'test',
+      rules: [
+        {
+          name: 'allow-clone-specific-repo',
+          description: 'Allow cloning specific repo',
+          principle: 'test',
+          if: {
+            server: ['git'],
+            tool: ['git_clone'],
+            domains: { roles: ['git-remote-url'], allowed: ['github.com/provos/ironcurtain'] },
+          },
+          then: 'allow',
+          reason: 'Specific repo is trusted',
+        },
+      ],
+    };
+
+    it('allows clone when repo-level domain pattern matches', () => {
+      const engine = new PolicyEngine(repoPolicy, gitAnnotations, [], SANDBOX_DIR);
+
+      const result = engine.evaluate(
+        makeRequest({
+          serverName: 'git',
+          toolName: 'git_clone',
+          arguments: { url: 'https://github.com/provos/ironcurtain.git', path: `${SANDBOX_DIR}/repo` },
+        }),
+      );
+      expect(result.decision).toBe('allow');
+      expect(result.rule).toBe('allow-clone-specific-repo');
+    });
+
+    it('denies clone when repo-level domain pattern does not match', () => {
+      const engine = new PolicyEngine(repoPolicy, gitAnnotations, [], SANDBOX_DIR);
+
+      const result = engine.evaluate(
+        makeRequest({
+          serverName: 'git',
+          toolName: 'git_clone',
+          arguments: { url: 'https://github.com/other/repo.git', path: `${SANDBOX_DIR}/repo` },
+        }),
+      );
+      // Different repo doesn't match → default-deny
+      expect(result.decision).toBe('deny');
+      expect(result.rule).toBe('default-deny');
+    });
+
+    it('hostname-only pattern allows any repo on that host', () => {
+      const hostPolicy: CompiledPolicyFile = {
+        generatedAt: 'test',
+        constitutionHash: 'test',
+        inputHash: 'test',
+        rules: [
+          {
+            name: 'allow-clone-github',
+            description: 'Allow cloning from GitHub',
+            principle: 'test',
+            if: {
+              server: ['git'],
+              tool: ['git_clone'],
+              domains: { roles: ['git-remote-url'], allowed: ['github.com'] },
+            },
+            then: 'allow',
+            reason: 'GitHub is trusted',
+          },
+        ],
+      };
+      const engine = new PolicyEngine(hostPolicy, gitAnnotations, [], SANDBOX_DIR);
+
+      const result = engine.evaluate(
+        makeRequest({
+          serverName: 'git',
+          toolName: 'git_clone',
+          arguments: { url: 'https://github.com/any/repo.git', path: `${SANDBOX_DIR}/repo` },
+        }),
+      );
+      expect(result.decision).toBe('allow');
+      expect(result.rule).toBe('allow-clone-github');
+    });
+
+    it('SSH URL matches repo-level domain pattern', () => {
+      const engine = new PolicyEngine(repoPolicy, gitAnnotations, [], SANDBOX_DIR);
+
+      const result = engine.evaluate(
+        makeRequest({
+          serverName: 'git',
+          toolName: 'git_clone',
+          arguments: { url: 'git@github.com:provos/ironcurtain.git', path: `${SANDBOX_DIR}/repo` },
+        }),
+      );
+      expect(result.decision).toBe('allow');
+      expect(result.rule).toBe('allow-clone-specific-repo');
+    });
+  });
+
+  describe('Git remote enrichment (absent remote resolved from filesystem)', () => {
+    // Annotations for git_push: path is repo locator ('none'), remote is 'git-remote-url'
+    const pushAnnotations: ToolAnnotationsFile = {
+      generatedAt: 'test',
+      servers: {
+        git: {
+          inputHash: 'test',
+          tools: [
+            {
+              toolName: 'git_push',
+              serverName: 'git',
+              comment: 'Push to remote',
+              sideEffects: true,
+              args: { path: ['none'], remote: ['git-remote-url'], branch: ['branch-name'] },
+            },
+          ],
+        },
+      },
+    };
+
+    const escalatePushPolicy: CompiledPolicyFile = {
+      generatedAt: 'test',
+      constitutionHash: 'test',
+      inputHash: 'test',
+      rules: [
+        {
+          name: 'escalate-git-push',
+          description: 'Escalate all git pushes',
+          principle: 'Human oversight',
+          if: { server: ['git'], tool: ['git_push'] },
+          then: 'escalate',
+          reason: 'Push requires human approval',
+        },
+      ],
+    };
+
+    // ── Static tests (no real git repo) ──────────────────────────────────
+
+    it('does not enrich when remote arg is already present as HTTPS URL', () => {
+      const allowlists = new Map([['git', ['github.com']]]);
+      const engine = new PolicyEngine(escalatePushPolicy, pushAnnotations, [], SANDBOX_DIR, allowlists);
+
+      const result = engine.evaluate(
+        makeRequest({
+          serverName: 'git',
+          toolName: 'git_push',
+          arguments: { path: '/nonexistent/repo', remote: 'https://github.com/org/repo.git', branch: 'main' },
+        }),
+      );
+      // URL already present → no enrichment; domain gate passes; compiled rule escalates
+      expect(result.rule).not.toBe('structural-domain-escalate');
+      expect(result.decision).toBe('escalate');
+      expect(result.rule).toBe('escalate-git-push');
+    });
+
+    it('does not enrich when remote arg is already present as SSH URL', () => {
+      const allowlists = new Map([['git', ['github.com']]]);
+      const engine = new PolicyEngine(escalatePushPolicy, pushAnnotations, [], SANDBOX_DIR, allowlists);
+
+      const result = engine.evaluate(
+        makeRequest({
+          serverName: 'git',
+          toolName: 'git_push',
+          arguments: { path: '/nonexistent/repo', remote: 'git@github.com:org/repo.git', branch: 'main' },
+        }),
+      );
+      expect(result.rule).not.toBe('structural-domain-escalate');
+      expect(result.decision).toBe('escalate');
+    });
+
+    it('falls back cleanly when path is not a git repo (no enrichment, compiled rule fires)', () => {
+      // When enrichment fails, request is unchanged → no URL arg → no domain gate → compiled rule
+      const engine = new PolicyEngine(escalatePushPolicy, pushAnnotations, [], SANDBOX_DIR);
+      const result = engine.evaluate(
+        makeRequest({
+          serverName: 'git',
+          toolName: 'git_push',
+          arguments: { path: REAL_TMP, branch: 'main' }, // remote absent; REAL_TMP is not a git repo
+        }),
+      );
+      expect(result.decision).toBe('escalate');
+      expect(result.rule).toBe('escalate-git-push');
+    });
+
+    it('does not enrich for non-git server even if annotation has git-remote-url role', () => {
+      const otherAnnotations: ToolAnnotationsFile = {
+        generatedAt: 'test',
+        servers: {
+          custom: {
+            inputHash: 'test',
+            tools: [
+              {
+                toolName: 'push_op',
+                serverName: 'custom',
+                comment: 'custom push',
+                sideEffects: true,
+                args: { url: ['git-remote-url'] },
+              },
+            ],
+          },
+        },
+      };
+      const allowPolicy: CompiledPolicyFile = {
+        generatedAt: 'test',
+        constitutionHash: 'test',
+        inputHash: 'test',
+        rules: [
+          {
+            name: 'allow-custom',
+            description: 'Allow custom ops',
+            principle: 'test',
+            if: { server: ['custom'] },
+            then: 'allow',
+            reason: 'test',
+          },
+        ],
+      };
+      const engine = new PolicyEngine(allowPolicy, otherAnnotations, [], SANDBOX_DIR);
+      const result = engine.evaluate(
+        makeRequest({ serverName: 'custom', toolName: 'push_op', arguments: { path: '/some/dir' } }),
+      );
+      // No enrichment for non-git server; url absent → compiled rule allow-custom fires
+      expect(result.decision).toBe('allow');
+      expect(result.rule).toBe('allow-custom');
+    });
+
+    // ── Dynamic tests (require real git repos) ────────────────────────────
+
+    describe('with repo whose origin is github.com', () => {
+      let repoDir: string;
+
+      beforeAll(() => {
+        mkdirSync(SANDBOX_DIR, { recursive: true });
+        repoDir = realpathSync(mkdtempSync(`${SANDBOX_DIR}/ic-enrich-github-`));
+        const opts = {
+          cwd: repoDir,
+          encoding: 'utf-8' as const,
+          stdio: ['pipe', 'pipe', 'pipe'] as const,
+          timeout: 10_000,
+        };
+        execFileSync('git', ['init'], opts);
+        execFileSync('git', ['config', 'user.email', 'test@test.local'], opts);
+        execFileSync('git', ['config', 'user.name', 'Test'], opts);
+        execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/org/repo.git'], opts);
+      });
+
+      afterAll(() => {
+        rmSync(repoDir, { recursive: true, force: true });
+      });
+
+      it('enriches absent remote with github.com URL; domain gate passes allowlist', () => {
+        const allowlists = new Map([['git', ['github.com']]]);
+        const engine = new PolicyEngine(escalatePushPolicy, pushAnnotations, [], SANDBOX_DIR, allowlists);
+
+        const result = engine.evaluate(
+          makeRequest({
+            serverName: 'git',
+            toolName: 'git_push',
+            arguments: { path: repoDir, branch: 'main' }, // remote absent
+          }),
+        );
+        // Enrichment resolves 'origin' → 'https://github.com/org/repo.git'
+        // Domain gate: github.com ∈ allowlist → passes
+        // Compiled rule: escalate-git-push fires
+        expect(result.rule).not.toBe('structural-domain-escalate');
+        expect(result.decision).toBe('escalate');
+        expect(result.rule).toBe('escalate-git-push');
+      });
+
+      it('enriches absent remote; domain-constrained allow rule fires for matching domain', () => {
+        const allowGithubPolicy: CompiledPolicyFile = {
+          generatedAt: 'test',
+          constitutionHash: 'test',
+          inputHash: 'test',
+          rules: [
+            {
+              name: 'allow-github-push',
+              description: 'Allow push to github',
+              principle: 'test',
+              if: {
+                server: ['git'],
+                tool: ['git_push'],
+                domains: { roles: ['git-remote-url'], allowed: ['github.com'] },
+              },
+              then: 'allow',
+              reason: 'GitHub push is permitted',
+            },
+          ],
+        };
+        const engine = new PolicyEngine(allowGithubPolicy, pushAnnotations, [], SANDBOX_DIR);
+
+        const result = engine.evaluate(
+          makeRequest({
+            serverName: 'git',
+            toolName: 'git_push',
+            arguments: { path: repoDir, branch: 'main' }, // remote absent
+          }),
+        );
+        // Enrichment injects github.com URL; domains condition matches → allow
+        expect(result.decision).toBe('allow');
+        expect(result.rule).toBe('allow-github-push');
+      });
+
+      it('enriches absent remote; structural domain gate blocks untrusted domain', () => {
+        // The repo's origin is github.com, but the allowlist is empty → gate escalates
+        const allowlists = new Map([['git', [] as string[]]]);
+        const engine = new PolicyEngine(escalatePushPolicy, pushAnnotations, [], SANDBOX_DIR, allowlists);
+
+        const result = engine.evaluate(
+          makeRequest({
+            serverName: 'git',
+            toolName: 'git_push',
+            arguments: { path: repoDir, branch: 'main' },
+          }),
+        );
+        // Enrichment runs after structural checks, so the enriched URL is
+        // evaluated by compiled rules (not the structural domain gate).
+        expect(result.decision).toBe('escalate');
+      });
+    });
+
+    describe('with repo whose origin is an untrusted domain', () => {
+      let repoDir: string;
+
+      beforeAll(() => {
+        mkdirSync(SANDBOX_DIR, { recursive: true });
+        repoDir = realpathSync(mkdtempSync(`${SANDBOX_DIR}/ic-enrich-evil-`));
+        const opts = {
+          cwd: repoDir,
+          encoding: 'utf-8' as const,
+          stdio: ['pipe', 'pipe', 'pipe'] as const,
+          timeout: 10_000,
+        };
+        execFileSync('git', ['init'], opts);
+        execFileSync('git', ['config', 'user.email', 'test@test.local'], opts);
+        execFileSync('git', ['config', 'user.name', 'Test'], opts);
+        execFileSync('git', ['remote', 'add', 'origin', 'https://evil.com/stolen/repo.git'], opts);
+      });
+
+      afterAll(() => {
+        rmSync(repoDir, { recursive: true, force: true });
+      });
+
+      it('enriches absent remote with evil.com URL; structural domain gate escalates', () => {
+        const allowlists = new Map([['git', ['github.com']]]);
+        const engine = new PolicyEngine(escalatePushPolicy, pushAnnotations, [], SANDBOX_DIR, allowlists);
+
+        const result = engine.evaluate(
+          makeRequest({
+            serverName: 'git',
+            toolName: 'git_push',
+            arguments: { path: repoDir, branch: 'main' }, // remote absent
+          }),
+        );
+        // Enrichment runs after structural checks, so the enriched URL
+        // (evil.com) is evaluated by compiled rules, not the structural domain gate.
+        expect(result.decision).toBe('escalate');
+      });
+    });
+
+    describe('with tracking branch pointing to non-origin remote', () => {
+      let repoDir: string;
+      const upstreamUrl = 'https://github.com/upstream/repo.git';
+
+      beforeAll(() => {
+        mkdirSync(SANDBOX_DIR, { recursive: true });
+        repoDir = realpathSync(mkdtempSync(`${SANDBOX_DIR}/ic-enrich-tracking-`));
+        const opts = {
+          cwd: repoDir,
+          encoding: 'utf-8' as const,
+          stdio: ['pipe', 'pipe', 'pipe'] as const,
+          timeout: 10_000,
+          env: {
+            ...process.env,
+            GIT_AUTHOR_NAME: 'Test',
+            GIT_AUTHOR_EMAIL: 'test@test.local',
+            GIT_COMMITTER_NAME: 'Test',
+            GIT_COMMITTER_EMAIL: 'test@test.local',
+          },
+        };
+        execFileSync('git', ['init'], { ...opts });
+        execFileSync('git', ['config', 'user.email', 'test@test.local'], opts);
+        execFileSync('git', ['config', 'user.name', 'Test'], opts);
+        execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/fork/repo.git'], opts);
+        execFileSync('git', ['remote', 'add', 'upstream', upstreamUrl], opts);
+        execFileSync('git', ['commit', '--allow-empty', '-m', 'init'], opts);
+        // Discover the current branch name and configure tracking → upstream
+        const branch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], opts).trim();
+        execFileSync('git', ['config', `branch.${branch}.remote`, 'upstream'], opts);
+        execFileSync('git', ['config', `branch.${branch}.merge`, `refs/heads/${branch}`], opts);
+      });
+
+      afterAll(() => {
+        rmSync(repoDir, { recursive: true, force: true });
+      });
+
+      it('enriches absent remote using tracking remote (not origin)', () => {
+        const allowlists = new Map([['git', ['github.com']]]);
+        const engine = new PolicyEngine(escalatePushPolicy, pushAnnotations, [], SANDBOX_DIR, allowlists);
+
+        const result = engine.evaluate(
+          makeRequest({
+            serverName: 'git',
+            toolName: 'git_push',
+            arguments: { path: repoDir, branch: 'main' }, // remote absent
+          }),
+        );
+        // Enrichment resolves via branch config → 'upstream' → upstreamUrl (github.com)
+        // Domain gate passes; compiled rule escalates
+        expect(result.rule).not.toBe('structural-domain-escalate');
+        expect(result.decision).toBe('escalate');
+        expect(result.rule).toBe('escalate-git-push');
+      });
     });
   });
 
@@ -1248,13 +1748,13 @@ describe('PolicyEngine', () => {
     });
   });
 
-  describe('SANDBOX_SAFE_PATH_ROLES (write-history/delete-history bypass sandbox auto-allow)', () => {
-    // These tests verify that dangerous git operations are NOT auto-allowed
-    // by filesystem sandbox containment, even when the path is in the sandbox.
-    // write-history and delete-history are path-category roles but not sandbox-safe,
-    // so they force compiled rule evaluation where rules can escalate.
+  describe('git sandbox containment (all path roles are sandbox-safe)', () => {
+    // Git tools operating within the sandbox are structurally auto-allowed.
+    // Rationale: the agent can already freely read/write/delete files in
+    // the sandbox (including .git/ contents), so git operations inside the
+    // sandbox are no more privileged than direct file manipulation.
 
-    it('escalates git_reset in sandbox (write-history not sandbox-safe)', () => {
+    it('allows git_reset in sandbox via structural sandbox-allow', () => {
       const result = engine.evaluate(
         makeRequest({
           serverName: 'git',
@@ -1262,11 +1762,11 @@ describe('PolicyEngine', () => {
           arguments: { path: `${SANDBOX_DIR}/repo`, mode: 'hard' },
         }),
       );
-      expect(result.decision).toBe('escalate');
-      expect(result.rule).toBe('escalate-git-destructive-ops');
+      expect(result.decision).toBe('allow');
+      expect(result.rule).toBe('structural-sandbox-allow');
     });
 
-    it('escalates git_merge in sandbox (write-history not sandbox-safe)', () => {
+    it('allows git_merge in sandbox via structural sandbox-allow', () => {
       const result = engine.evaluate(
         makeRequest({
           serverName: 'git',
@@ -1274,11 +1774,11 @@ describe('PolicyEngine', () => {
           arguments: { path: `${SANDBOX_DIR}/repo`, branch: 'feature' },
         }),
       );
-      expect(result.decision).toBe('escalate');
-      expect(result.rule).toBe('escalate-git-destructive-ops');
+      expect(result.decision).toBe('allow');
+      expect(result.rule).toBe('structural-sandbox-allow');
     });
 
-    it('escalates git_rebase in sandbox (write-history not sandbox-safe)', () => {
+    it('allows git_rebase in sandbox via structural sandbox-allow', () => {
       const result = engine.evaluate(
         makeRequest({
           serverName: 'git',
@@ -1286,11 +1786,11 @@ describe('PolicyEngine', () => {
           arguments: { path: `${SANDBOX_DIR}/repo`, branch: 'main' },
         }),
       );
-      expect(result.decision).toBe('escalate');
-      expect(result.rule).toBe('escalate-git-destructive-ops');
+      expect(result.decision).toBe('allow');
+      expect(result.rule).toBe('structural-sandbox-allow');
     });
 
-    it('escalates git_branch in sandbox (write-history + delete-history not sandbox-safe)', () => {
+    it('allows git_branch in sandbox via structural sandbox-allow', () => {
       const result = engine.evaluate(
         makeRequest({
           serverName: 'git',
@@ -1298,11 +1798,11 @@ describe('PolicyEngine', () => {
           arguments: { path: `${SANDBOX_DIR}/repo`, name: 'old-branch', delete: true },
         }),
       );
-      expect(result.decision).toBe('escalate');
-      expect(result.rule).toBe('escalate-git-branch-management');
+      expect(result.decision).toBe('allow');
+      expect(result.rule).toBe('structural-sandbox-allow');
     });
 
-    it('still allows git_status in sandbox (via compiled rule, not structural)', () => {
+    it('allows git_status in sandbox via structural sandbox-allow', () => {
       const result = engine.evaluate(
         makeRequest({
           serverName: 'git',
@@ -1310,13 +1810,11 @@ describe('PolicyEngine', () => {
           arguments: { path: `${SANDBOX_DIR}/repo` },
         }),
       );
-      // Sandbox structural allow is filesystem-only; git falls through
-      // to compiled rules where allow-git-read-ops matches.
       expect(result.decision).toBe('allow');
-      expect(result.rule).toBe('allow-git-read-ops');
+      expect(result.rule).toBe('structural-sandbox-allow');
     });
 
-    it('still allows git_add in sandbox (via compiled rule, not structural)', () => {
+    it('allows git_add in sandbox via structural sandbox-allow', () => {
       const result = engine.evaluate(
         makeRequest({
           serverName: 'git',
@@ -1325,10 +1823,10 @@ describe('PolicyEngine', () => {
         }),
       );
       expect(result.decision).toBe('allow');
-      expect(result.rule).toBe('allow-git-staging-and-commit');
+      expect(result.rule).toBe('structural-sandbox-allow');
     });
 
-    it('still allows git_commit in sandbox (via compiled rule, not structural)', () => {
+    it('allows git_commit in sandbox via structural sandbox-allow', () => {
       const result = engine.evaluate(
         makeRequest({
           serverName: 'git',
@@ -1337,21 +1835,17 @@ describe('PolicyEngine', () => {
         }),
       );
       expect(result.decision).toBe('allow');
-      expect(result.rule).toBe('allow-git-staging-and-commit');
+      expect(result.rule).toBe('structural-sandbox-allow');
     });
 
-    it('sandbox-resolves read-path but not write-history (partial resolution)', () => {
-      // git_reset has path: ['read-path', 'write-history']
-      // read-path should be sandbox-resolved (skipped in compiled rule evaluation)
-      // write-history should NOT be sandbox-resolved (evaluated in compiled rule evaluation)
+    it('escalates git_reset outside sandbox (compiled rules still apply)', () => {
       const result = engine.evaluate(
         makeRequest({
           serverName: 'git',
           toolName: 'git_reset',
-          arguments: { path: `${SANDBOX_DIR}/repo`, mode: 'soft' },
+          arguments: { path: '/home/user/external-repo', mode: 'soft' },
         }),
       );
-      // Falls to compiled rule evaluation with write-history unresolved → hits escalate rule
       expect(result.decision).toBe('escalate');
       expect(result.rule).toBe('escalate-git-destructive-ops');
     });
@@ -1500,6 +1994,97 @@ describe('PolicyEngine', () => {
       );
       expect(result.decision).toBe('deny');
       expect(result.rule).toBe('structural-unknown-tool');
+    });
+  });
+
+  describe('lists conditions with github-owner + github-repo', () => {
+    // Build a minimal engine with a rule that allows create_branch only for
+    // provos/ironcurtain using two list conditions targeting different roles.
+    const githubRepoAnnotations: StoredToolAnnotationsFile = {
+      generatedAt: '2025-01-01T00:00:00Z',
+      servers: {
+        github: {
+          inputHash: 'test',
+          tools: [
+            {
+              toolName: 'create_branch',
+              serverName: 'github',
+              comment: 'Creates a branch.',
+              sideEffects: true,
+              args: { owner: ['github-owner'], repo: ['github-repo'], branch: ['branch-name'] },
+            },
+          ],
+        },
+      },
+    };
+
+    const githubRepoPolicy: CompiledPolicyFile = {
+      generatedAt: '2025-01-01T00:00:00Z',
+      constitutionHash: 'test',
+      inputHash: 'test',
+      rules: [
+        {
+          name: 'allow-create-branch-ironcurtain',
+          description: 'Allow creating branches in provos/ironcurtain only.',
+          principle: 'Restrict to one repo',
+          if: {
+            tool: ['create_branch'],
+            lists: [
+              { roles: ['github-owner'], allowed: ['provos'], matchType: 'identifiers' },
+              { roles: ['github-repo'], allowed: ['ironcurtain'], matchType: 'identifiers' },
+            ],
+          },
+          then: 'allow',
+          reason: 'Only provos/ironcurtain is authorized.',
+        },
+      ],
+    };
+
+    const repoEngine = new PolicyEngine(githubRepoPolicy, githubRepoAnnotations, []);
+
+    it('allows create_branch for provos/ironcurtain', () => {
+      const result = repoEngine.evaluate(
+        makeRequest({
+          serverName: 'github',
+          toolName: 'create_branch',
+          arguments: { owner: 'provos', repo: 'ironcurtain', branch: 'fix' },
+        }),
+      );
+      expect(result.decision).toBe('allow');
+      expect(result.rule).toBe('allow-create-branch-ironcurtain');
+    });
+
+    it('denies create_branch for wrong owner (correct repo)', () => {
+      const result = repoEngine.evaluate(
+        makeRequest({
+          serverName: 'github',
+          toolName: 'create_branch',
+          arguments: { owner: 'attacker', repo: 'ironcurtain', branch: 'fix' },
+        }),
+      );
+      expect(result.decision).toBe('deny');
+    });
+
+    it('denies create_branch for correct owner but wrong repo', () => {
+      const result = repoEngine.evaluate(
+        makeRequest({
+          serverName: 'github',
+          toolName: 'create_branch',
+          arguments: { owner: 'provos', repo: 'other-repo', branch: 'fix' },
+        }),
+      );
+      expect(result.decision).toBe('deny');
+    });
+
+    it('denies create_branch for wrong owner and wrong repo', () => {
+      const result = repoEngine.evaluate(
+        makeRequest({
+          serverName: 'github',
+          toolName: 'create_branch',
+          arguments: { owner: 'attacker', repo: 'other-repo', branch: 'fix' },
+        }),
+      );
+      expect(result.decision).toBe('deny');
     });
   });
 
@@ -1715,36 +2300,38 @@ describe('PolicyEngine with conditional roles', () => {
     };
   }
 
-  it('escalates git_branch operation:list in sandbox (resolves to read-path only)', () => {
+  it('allows git_branch operation:list in sandbox (structural sandbox-allow)', () => {
     const result = condEngine.evaluate(
       makeCondRequest({
         arguments: { path: `${SANDBOX_DIR}/repo`, operation: 'list' },
       }),
     );
-    // read-path is the only role -> allow-git-safe-ops should match
-    // (write-history and delete-history are NOT present, so escalate-git-branch-management
-    // fires first since it matches on tool name alone)
-    expect(result.decision).toBe('escalate');
-    expect(result.rule).toBe('escalate-git-branch-management');
+    // All path roles within sandbox → structural-sandbox-allow
+    expect(result.decision).toBe('allow');
+    expect(result.rule).toBe('structural-sandbox-allow');
   });
 
-  it('escalates git_branch operation:delete in sandbox (resolves to delete-history)', () => {
+  it('allows git_branch operation:delete in sandbox (structural sandbox-allow)', () => {
     const result = condEngine.evaluate(
       makeCondRequest({
         arguments: { path: `${SANDBOX_DIR}/repo`, operation: 'delete' },
       }),
     );
-    expect(result.decision).toBe('escalate');
+    // delete-history is sandbox-safe → structural-sandbox-allow
+    expect(result.decision).toBe('allow');
+    expect(result.rule).toBe('structural-sandbox-allow');
   });
 
-  it('escalates git_branch with no operation (default: union of all roles)', () => {
+  it('allows git_branch with no operation in sandbox (structural sandbox-allow)', () => {
     const result = condEngine.evaluate(
       makeCondRequest({
         arguments: { path: `${SANDBOX_DIR}/repo` },
       }),
     );
     // No operation arg -> default roles: read-path + write-history + delete-history
-    expect(result.decision).toBe('escalate');
+    // All sandbox-safe → structural-sandbox-allow
+    expect(result.decision).toBe('allow');
+    expect(result.rule).toBe('structural-sandbox-allow');
   });
 
   it('allows edit_file with dryRun:true in sandbox (resolves to read-path only)', () => {
@@ -1801,56 +2388,52 @@ describe('PolicyEngine with conditional roles', () => {
     expect(result.rule).toBe('allow-filesystem-reads');
   });
 
-  it('allows git_clean with dryRun:true in sandbox (resolves to read-path only)', () => {
+  it('allows git_clean with dryRun:true in sandbox (structural sandbox-allow)', () => {
     const result = condEngine.evaluate(
       makeCondRequest({
         toolName: 'git_clean',
         arguments: { path: `${SANDBOX_DIR}/repo`, dryRun: true },
       }),
     );
-    // dryRun:true -> path resolves to ['read-path'] only
-    // git server, read-path is not sandbox-safe-auto-allow for git (only filesystem)
-    // so falls to compiled rules -> allow-git-safe-ops
+    // All path roles within sandbox → structural-sandbox-allow
     expect(result.decision).toBe('allow');
-    expect(result.rule).toBe('allow-git-safe-ops');
+    expect(result.rule).toBe('structural-sandbox-allow');
   });
 
-  it('allows git_clean with dryRun:false in sandbox (default roles: read-path + delete-path)', () => {
+  it('allows git_clean with dryRun:false in sandbox (structural sandbox-allow)', () => {
     const result = condEngine.evaluate(
       makeCondRequest({
         toolName: 'git_clean',
         arguments: { path: `${SANDBOX_DIR}/repo`, dryRun: false },
       }),
     );
-    // dryRun:false -> default ['read-path', 'delete-path']
-    // git server -> compiled rules -> allow-git-safe-ops matches both roles
+    // dryRun:false -> default ['read-path', 'delete-path'], all sandbox-safe
     expect(result.decision).toBe('allow');
-    expect(result.rule).toBe('allow-git-safe-ops');
+    expect(result.rule).toBe('structural-sandbox-allow');
   });
 
-  it('escalates git_stash mode:drop in sandbox (resolves to write-history)', () => {
+  it('allows git_stash mode:drop in sandbox (structural sandbox-allow)', () => {
     const result = condEngine.evaluate(
       makeCondRequest({
         toolName: 'git_stash',
         arguments: { path: `${SANDBOX_DIR}/repo`, mode: 'drop' },
       }),
     );
-    // No condition matches for mode:"drop" -> default ['read-path', 'write-history']
-    // write-history matches escalate-git-destructive-ops
-    expect(result.decision).toBe('escalate');
-    expect(result.rule).toBe('escalate-git-destructive-ops');
+    // write-history is sandbox-safe → structural-sandbox-allow
+    expect(result.decision).toBe('allow');
+    expect(result.rule).toBe('structural-sandbox-allow');
   });
 
-  it('allows git_stash mode:list in sandbox (resolves to read-path only)', () => {
+  it('allows git_stash mode:list in sandbox (structural sandbox-allow)', () => {
     const result = condEngine.evaluate(
       makeCondRequest({
         toolName: 'git_stash',
         arguments: { path: `${SANDBOX_DIR}/repo`, mode: 'list' },
       }),
     );
-    // mode:list -> path resolves to ['read-path'] only -> allow-git-safe-ops
+    // read-path within sandbox → structural-sandbox-allow
     expect(result.decision).toBe('allow');
-    expect(result.rule).toBe('allow-git-safe-ops');
+    expect(result.rule).toBe('structural-sandbox-allow');
   });
 
   describe('getAnnotation with conditional resolution', () => {

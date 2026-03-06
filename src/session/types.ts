@@ -191,6 +191,13 @@ export interface SessionOptions {
   onEscalationExpired?: () => void;
 
   /**
+   * Callback invoked when a pending escalation is resolved (approved or denied).
+   * Fires after the response file is written, regardless of whether the resolution
+   * was initiated by the transport or by the proxy (e.g., Signal approve command).
+   */
+  onEscalationResolved?: (escalationId: string, decision: 'approved' | 'denied') => void;
+
+  /**
    * Callback invoked during message processing with diagnostic events.
    * Transports use this to display progress (e.g., tool call previews).
    * If not provided, diagnostics are silently dropped.
@@ -203,6 +210,30 @@ export interface SessionOptions {
    * Must be validated via validateWorkspacePath() before passing here.
    */
   workspacePath?: string;
+
+  /**
+   * When set, loads compiled-policy.json (and optionally
+   * dynamic-lists.json) from this directory instead of the global
+   * generated directory. Tool annotations are always loaded from
+   * the global location regardless of this setting.
+   *
+   * Used by cron sessions to load task-scoped policy.
+   */
+  policyDir?: string;
+
+  /**
+   * Additional content appended to the system prompt.
+   * Used by cron sessions to inject task context and workspace
+   * conventions.
+   */
+  systemPromptAugmentation?: string;
+
+  /**
+   * When true, disables the auto-approver for this session even if
+   * enabled in user config. Used by cron/headless sessions where there
+   * is no interactive user context to match escalations against.
+   */
+  disableAutoApprove?: boolean;
 }
 
 /**

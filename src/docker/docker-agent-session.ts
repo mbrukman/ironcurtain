@@ -57,6 +57,7 @@ export interface DockerAgentSessionDeps {
   readonly useTcp?: boolean;
   readonly onEscalation?: (request: EscalationRequest) => void;
   readonly onEscalationExpired?: () => void;
+  readonly onEscalationResolved?: (escalationId: string, decision: 'approved' | 'denied') => void;
   readonly onDiagnostic?: (event: DiagnosticEvent) => void;
   /**
    * When set, proxies are already started, orientation is built, and
@@ -103,6 +104,7 @@ export class DockerAgentSession implements Session {
 
   private readonly onEscalation?: (request: EscalationRequest) => void;
   private readonly onEscalationExpired?: () => void;
+  private readonly onEscalationResolved?: (escalationId: string, decision: 'approved' | 'denied') => void;
   private readonly onDiagnostic?: (event: DiagnosticEvent) => void;
   private readonly preBuiltInfrastructure?: DockerAgentSessionDeps['preBuiltInfrastructure'];
 
@@ -122,6 +124,7 @@ export class DockerAgentSession implements Session {
     this.useTcp = deps.useTcp ?? false;
     this.onEscalation = deps.onEscalation;
     this.onEscalationExpired = deps.onEscalationExpired;
+    this.onEscalationResolved = deps.onEscalationResolved;
     this.onDiagnostic = deps.onDiagnostic;
     this.preBuiltInfrastructure = deps.preBuiltInfrastructure;
     this.createdAt = new Date().toISOString();
@@ -321,6 +324,7 @@ export class DockerAgentSession implements Session {
     this.escalationWatcher = createEscalationWatcher(this.escalationDir, {
       onEscalation: (request) => this.onEscalation?.(request),
       onEscalationExpired: () => this.onEscalationExpired?.(),
+      onEscalationResolved: (id, decision) => this.onEscalationResolved?.(id, decision),
     });
     this.escalationWatcher.start();
 
