@@ -191,6 +191,18 @@ Both use the same PolicyEngine with compiled artifacts.
 - LLM-assisted constitution customization: `npm run customize-policy` interactive CLI
 - 6-phase migration: (1) role extensibility, (2) engine domain support, (3) git server, (4) fetch server, (5) user config, (6) constitution customizer
 
+## Memory MCP Server Design (designed 2026-03-09)
+- See `docs/designs/memory-mcp-server.md` for full spec
+- Uses `@modelcontextprotocol/server-memory` (official, MIT, knowledge graph, JSONL)
+- Dynamically injected into mcpServers (not static in mcp-servers.json)
+- Namespaced via MEMORY_FILE_PATH env var per session type
+- Storage: `~/.ironcurtain/personas/<name>/memory.jsonl`, `jobs/<id>/memory.jsonl`, `memory/default.jsonl`
+- Config: `memory.enabled` in user-config (default: true)
+- Policy: blanket allow for memory server (all args are 'none' role)
+- System prompt: pointer to memory server (NOT full content injection)
+- Replaces `memory.md` system prompt injection approach
+- Always included in server allowlist (like filesystem)
+
 ## Auto-Approver -- see `auto-approver.md` topic file
 ## Signal Transport -- `docs/designs/signal-transport.md`; `src/signal/` module
 ## Docker Agent Mode -- see `docker-agent.md` topic file
