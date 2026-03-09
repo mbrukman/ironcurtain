@@ -30,11 +30,10 @@ jobs:
             const now = Date.now();
             const cutoff = CHALLENGE_HOURS * 60 * 60 * 1000;
 
-            // Only look at issues updated in the relevant window.
-            // Issues not updated since before the challenge period cannot
-            // have an expiring challenge, and skipping them avoids
-            // API rate-limit exhaustion from spam issues.
-            const since = new Date(now - cutoff - 24 * 60 * 60 * 1000);
+            // Only look at issues updated within the last ~30 days.
+            // This avoids API rate-limit exhaustion from very old spam
+            // issues while still catching challenges that expired days ago.
+            const since = new Date(now - cutoff - 30 * 24 * 60 * 60 * 1000);
 
             const issues = await github.paginate(
               github.rest.issues.listForRepo,
