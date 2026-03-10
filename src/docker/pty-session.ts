@@ -23,6 +23,7 @@ import ora from 'ora';
 import type { IronCurtainConfig } from '../config/types.js';
 import type { SessionMode } from '../session/types.js';
 import { createSessionId } from '../session/types.js';
+import { patchMcpServerAllowedDirectory } from '../session/index.js';
 import { CONTAINER_WORKSPACE_DIR } from './agent-adapter.js';
 import { PTY_SOCK_NAME, DEFAULT_PTY_PORT } from './pty-types.js';
 import type { PtySessionRegistration } from './pty-types.js';
@@ -96,6 +97,11 @@ export async function runPtySession(options: PtySessionOptions): Promise<void> {
     isPtySession: true,
     mcpServers: JSON.parse(JSON.stringify(options.config.mcpServers)) as typeof options.config.mcpServers,
   };
+
+  // Sync the filesystem server's directory arg with the session sandbox.
+  // Without this, the filesystem server inherits the stale default from
+  // loadConfig() (~/.ironcurtain/sandbox) instead of the session workspace.
+  patchMcpServerAllowedDirectory(sessionConfig, sandboxDir);
 
   const initSpinner = ora({
     text: `Initializing PTY session (${options.mode.agent})...`,
