@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-03-11
+
+### Fixes
+
+- **Mux command-mode input retention** — preserve the input buffer when toggling between command mode and PTY mode with Ctrl-A; previously any typed text was lost on mode switch
+- **Stay in command mode after /new** — spawning a new session via `/new` (quick-spawn or directory picker) now returns to command mode instead of switching to PTY mode
+
 ## [0.7.1] - 2026-03-10
 
 ### Fixes
