@@ -1,0 +1,51 @@
+name: Release memory-mcp-server
+
+on:
+  push:
+    tags:
+      - 'memory-mcp-server/v*'
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - name: Upgrade npm for OIDC trusted publishing support
+        run: npm install -g npm@latest
+
+      - run: npm ci
+
+      - name: Lint
+        run: npm run lint --workspace packages/memory-mcp-server
+
+      - name: Format check
+        run: npm run format:check --workspace packages/memory-mcp-server
+
+      - name: Build
+        run: npm run build --workspace packages/memory-mcp-server
+
+      - name: Test
+        run: npm test --workspace packages/memory-mcp-server
+
+      - name: Publish to npm
+        run: npm publish --workspace packages/memory-mcp-server --provenance
+
+      - name: Create GitHub Release
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#memory-mcp-server/}"
+          gh release create "$tag" \
+            --title "memory-mcp-server $version" \
+            --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
