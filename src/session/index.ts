@@ -27,7 +27,7 @@ import { resolvePersona, applyServerAllowlist } from '../persona/resolve.js';
 import { buildPersonaSystemPromptAugmentation } from '../persona/persona-prompt.js';
 import { resolveMemoryDbPath } from '../memory/resolve-memory-path.js';
 import { buildMemoryServerConfig, MEMORY_SERVER_NAME } from '../memory/memory-annotations.js';
-import { buildMemorySystemPrompt } from '../memory/memory-prompt.js';
+import { buildMemorySystemPrompt, adaptMemoryToolNames } from '../memory/memory-prompt.js';
 import { AgentSession } from './agent-session.js';
 import { SessionError } from './errors.js';
 import { saveSessionMetadata, loadSessionMetadata } from './session-metadata.js';
@@ -403,7 +403,7 @@ export function buildSessionConfig(
     // For non-persona cron jobs, inject memory usage instructions since
     // persona sessions get this via buildPersonaSystemPromptAugmentation.
     if (!opts.persona) {
-      const memoryPrompt = buildMemorySystemPrompt();
+      const memoryPrompt = adaptMemoryToolNames(buildMemorySystemPrompt());
       systemPromptAugmentation = systemPromptAugmentation
         ? `${memoryPrompt}\n\n${systemPromptAugmentation}`
         : memoryPrompt;
