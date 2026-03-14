@@ -2459,4 +2459,65 @@ describe('PolicyEngine with conditional roles', () => {
       expect(stored).toBeUndefined();
     });
   });
+
+  describe('trusted server policy', () => {
+    const trustedEngine = new PolicyEngine(
+      testCompiledPolicy,
+      testToolAnnotations,
+      protectedPaths,
+      SANDBOX_DIR,
+      undefined,
+      undefined,
+      new Set(['memory']),
+    );
+
+    it('allows any tool from a trusted server without annotations', () => {
+      const result = trustedEngine.evaluate(
+        makeRequest({ serverName: 'memory', toolName: 'memory_store', arguments: { content: 'hello' } }),
+      );
+      expect(result.decision).toBe('allow');
+      expect(result.rule).toBe('trusted-server');
+    });
+
+    it('allows memory_recall from a trusted server', () => {
+      const result = trustedEngine.evaluate(
+        makeRequest({ serverName: 'memory', toolName: 'memory_recall', arguments: { query: 'test' } }),
+      );
+      expect(result.decision).toBe('allow');
+      expect(result.rule).toBe('trusted-server');
+    });
+
+    it('allows unknown tool names from a trusted server', () => {
+      const result = trustedEngine.evaluate(
+        makeRequest({ serverName: 'memory', toolName: 'nonexistent_tool', arguments: {} }),
+      );
+      expect(result.decision).toBe('allow');
+      expect(result.rule).toBe('trusted-server');
+    });
+
+    it('does not affect non-trusted servers', () => {
+      const result = trustedEngine.evaluate(
+        makeRequest({ serverName: 'filesystem', toolName: 'read_file', arguments: { path: '/etc/passwd' } }),
+      );
+      // Should go through normal policy evaluation, not trusted-server shortcut
+      expect(result.rule).not.toBe('trusted-server');
+    });
+
+    it('isTrustedServer returns true for trusted servers', () => {
+      expect(trustedEngine.isTrustedServer('memory')).toBe(true);
+    });
+
+    it('isTrustedServer returns false for non-trusted servers', () => {
+      expect(trustedEngine.isTrustedServer('filesystem')).toBe(false);
+    });
+
+    it('denies memory tools when trustedServers is not configured', () => {
+      const baseEngine = new PolicyEngine(testCompiledPolicy, testToolAnnotations, protectedPaths, SANDBOX_DIR);
+      const result = baseEngine.evaluate(
+        makeRequest({ serverName: 'memory', toolName: 'memory_store', arguments: { content: 'hello' } }),
+      );
+      expect(result.decision).toBe('deny');
+      expect(result.rule).toBe('structural-unknown-tool');
+    });
+  });
 });

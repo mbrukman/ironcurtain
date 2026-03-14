@@ -6,8 +6,8 @@
  * are not exported -- callers depend on the Session interface only.
  */
 
-import { existsSync, mkdirSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { existsSync, mkdirSync, writeFileSync, unlinkSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import { loadConfig } from '../config/index.js';
 import {
   getIronCurtainHome,
@@ -25,6 +25,9 @@ import * as logger from '../logger.js';
 import { resolveRealPath } from '../types/argument-roles.js';
 import { resolvePersona, applyServerAllowlist } from '../persona/resolve.js';
 import { buildPersonaSystemPromptAugmentation } from '../persona/persona-prompt.js';
+import { resolveMemoryDbPath } from '../memory/resolve-memory-path.js';
+import { buildMemoryServerConfig, MEMORY_SERVER_NAME } from '../memory/memory-annotations.js';
+import { buildMemorySystemPrompt } from '../memory/memory-prompt.js';
 import { AgentSession } from './agent-session.js';
 import { SessionError } from './errors.js';
 import { saveSessionMetadata, loadSessionMetadata } from './session-metadata.js';
@@ -108,7 +111,13 @@ async function createBuiltinSession(options: SessionOptions): Promise<Session> {
     ? { ...options, systemPromptAugmentation: sessionConfig.systemPromptAugmentation }
     : options;
 
-  const session = new AgentSession(sessionConfig.config, sessionId, sessionConfig.escalationDir, effectiveOptions);
+  const session = new AgentSession(
+    sessionConfig.config,
+    sessionId,
+    sessionConfig.escalationDir,
+    sessionConfig.sessionDir,
+    effectiveOptions,
+  );
 
   try {
     await session.initialize();
@@ -145,6 +154,12 @@ async function createDockerSession(
 
   const { prepareDockerInfrastructure } = await import('../docker/docker-infrastructure.js');
   const { DockerAgentSession } = await import('../docker/docker-agent-session.js');
+  const { buildDockerClaudeMd } = await import('../docker/claude-md-seed.js');
+
+  const claudeMdContent = buildDockerClaudeMd({
+    personaName: options.persona,
+    memoryEnabled: config.userConfig.memory.enabled,
+  });
 
   const infra = await prepareDockerInfrastructure(
     sessionConfig.config,
@@ -155,6 +170,22 @@ async function createDockerSession(
     sessionConfig.auditLogPath,
     sessionId,
   );
+
+  // Write CLAUDE.md into conversation state dir (unconditionally, even on
+  // resume, since persona/memory config may change between sessions).
+  // Clean up stale CLAUDE.md when memory is disabled to avoid leftover rules.
+  if (infra.conversationStateDir) {
+    const claudeMdPath = resolve(infra.conversationStateDir, 'CLAUDE.md');
+    if (claudeMdContent) {
+      writeFileSync(claudeMdPath, claudeMdContent);
+    } else {
+      try {
+        unlinkSync(claudeMdPath);
+      } catch {
+        /* not present */
+      }
+    }
+  }
 
   const session = new DockerAgentSession({
     config: sessionConfig.config,
@@ -198,7 +229,7 @@ async function createDockerSession(
 }
 
 /** Paths and patched config produced by buildSessionConfig. */
-interface SessionDirConfig {
+export interface SessionDirConfig {
   config: IronCurtainConfig;
   sessionDir: string;
   sandboxDir: string;
@@ -245,13 +276,19 @@ function validatePolicyDir(policyDir: string): void {
  * server allowlist, and system prompt augmentation. Persona takes
  * precedence over explicit policyDir if both are provided.
  */
-function buildSessionConfig(
+export function buildSessionConfig(
   config: IronCurtainConfig,
   effectiveSessionId: string,
   sessionId: SessionId,
   opts: Pick<
     SessionOptions,
-    'resumeSessionId' | 'workspacePath' | 'policyDir' | 'disableAutoApprove' | 'persona' | 'systemPromptAugmentation'
+    | 'resumeSessionId'
+    | 'workspacePath'
+    | 'policyDir'
+    | 'disableAutoApprove'
+    | 'persona'
+    | 'systemPromptAugmentation'
+    | 'jobId'
   > = {},
 ): SessionDirConfig {
   let { workspacePath, policyDir, systemPromptAugmentation } = opts;
@@ -273,13 +310,9 @@ function buildSessionConfig(
       workspacePath = resolved.workspacePath;
     }
 
-    // Build persona system prompt augmentation (includes memory contents).
-    // workspacePath is guaranteed set here (either from opts or resolved above),
-    // so the memory path is always inside the session's allowedDirectory.
-    const personaAugmentation = buildPersonaSystemPromptAugmentation(
-      resolved.persona,
-      resolve(workspacePath, 'memory.md'),
-    );
+    // Build persona system prompt augmentation (includes MCP memory prompt when enabled).
+    const memoryEnabled = config.userConfig.memory.enabled;
+    const personaAugmentation = buildPersonaSystemPromptAugmentation(resolved.persona, memoryEnabled);
     systemPromptAugmentation = systemPromptAugmentation
       ? `${personaAugmentation}\n\n${systemPromptAugmentation}`
       : personaAugmentation;
@@ -349,6 +382,32 @@ function buildSessionConfig(
   // Apply server allowlist if persona specifies one
   if (serverAllowlist) {
     sessionConfig.mcpServers = applyServerAllowlist(sessionConfig.mcpServers, serverAllowlist);
+  }
+
+  // Inject the memory MCP server for persona and cron job sessions only.
+  // Default (ad-hoc) sessions are stateless and don't benefit from memory.
+  const memoryConfig = config.userConfig.memory;
+  if (memoryConfig.enabled && (opts.persona || opts.jobId)) {
+    const dbPath = resolveMemoryDbPath({
+      persona: opts.persona,
+      jobId: opts.jobId,
+    });
+    mkdirSync(dirname(dbPath), { recursive: true });
+    sessionConfig.mcpServers[MEMORY_SERVER_NAME] = buildMemoryServerConfig({
+      dbPath,
+      namespace: (opts.persona ?? opts.jobId) as string,
+      llmBaseUrl: memoryConfig.llmBaseUrl,
+      llmApiKey: memoryConfig.llmApiKey,
+    });
+
+    // For non-persona cron jobs, inject memory usage instructions since
+    // persona sessions get this via buildPersonaSystemPromptAugmentation.
+    if (!opts.persona) {
+      const memoryPrompt = buildMemorySystemPrompt();
+      systemPromptAugmentation = systemPromptAugmentation
+        ? `${memoryPrompt}\n\n${systemPromptAugmentation}`
+        : memoryPrompt;
+    }
   }
 
   // Patch MCP server args to use the session-specific sandbox directory

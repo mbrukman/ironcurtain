@@ -75,7 +75,9 @@ import { type ServerContextMap, updateServerContext, formatServerContext } from 
 import { permissiveJsonSchemaValidator } from './permissive-output-validator.js';
 import type { LanguageModelV3 } from '@ai-sdk/provider';
 import type { MCPServerConfig, SandboxAvailabilityPolicy } from '../config/types.js';
+import type { ToolAnnotation } from '../pipeline/types.js';
 import { VERSION } from '../version.js';
+import { buildTrustedServerSet } from '../memory/memory-annotations.js';
 import { loadToolDescriptionHints, applyToolDescriptionHints } from './tool-description-hints.js';
 
 export interface ProxiedTool {
@@ -608,9 +610,12 @@ export async function handleCallTool(
     };
   }
 
-  // Annotation-driven normalization: split into transport vs policy args
+  // Annotation-driven normalization: split into transport vs policy args.
+  // Trusted servers skip annotation lookup and prepareToolArgs — use raw args directly.
   const annotation = deps.policyEngine.getAnnotation(toolInfo.serverName, toolInfo.name, rawArgs);
-  if (!annotation) {
+  const isTrusted = !annotation && deps.policyEngine.isTrustedServer(toolInfo.serverName);
+
+  if (!annotation && !isTrusted) {
     return {
       content: [
         {
@@ -622,49 +627,61 @@ export async function handleCallTool(
     };
   }
 
-  // Enrich git tool args with the locally tracked working directory when
-  // the agent omits the `path` argument. The git MCP server tracks its own
-  // CWD (set via git_set_working_dir) and uses it implicitly, but the
-  // policy engine needs the explicit path to resolve sandbox containment
-  // and the default remote URL for domain-based policy rules.
-  // The serverContextMap mirrors the git server's working directory from
-  // successful git_set_working_dir / git_clone calls, avoiding an RPC.
-  let effectiveRawArgs = rawArgs;
-  const hasEffectivePath = 'path' in rawArgs && typeof rawArgs.path === 'string' && rawArgs.path.trim() !== '';
-  if (toolInfo.serverName === 'git' && 'path' in annotation.args && !hasEffectivePath) {
-    const gitWorkDir = deps.serverContextMap.get('git')?.workingDirectory;
-    if (!gitWorkDir) {
-      const errorMsg = 'Git server has no working directory set. Call git_set_working_dir first.';
-      deps.auditLog.log(
-        buildAuditEntry(
-          {
-            requestId: uuidv4(),
-            serverName: toolInfo.serverName,
-            toolName: toolInfo.name,
-            arguments: rawArgs,
-            timestamp: new Date().toISOString(),
-          },
-          rawArgs,
-          { status: 'deny', rule: 'git-path-enrichment-failed', reason: errorMsg },
-          { status: 'denied', error: errorMsg },
-          0,
-          {},
-        ),
-      );
-      return {
-        content: [{ type: 'text', text: `Error: ${errorMsg}` }],
-        isError: true,
-      };
-    }
-    effectiveRawArgs = { ...rawArgs, path: gitWorkDir };
-  }
+  let argsForTransport: Record<string, unknown>;
+  let argsForPolicy: Record<string, unknown>;
 
-  const { argsForTransport, argsForPolicy } = prepareToolArgs(
-    effectiveRawArgs,
-    annotation,
-    deps.allowedDirectory,
-    CONTAINER_WORKSPACE_DIR,
-  );
+  if (isTrusted) {
+    // Trusted server with no annotation: use raw args for both transport and policy
+    argsForTransport = rawArgs;
+    argsForPolicy = rawArgs;
+  } else {
+    // annotation is guaranteed non-null here: we returned early if both are falsy
+    const resolvedAnnotation = annotation as ToolAnnotation;
+
+    // Enrich git tool args with the locally tracked working directory when
+    // the agent omits the `path` argument. The git MCP server tracks its own
+    // CWD (set via git_set_working_dir) and uses it implicitly, but the
+    // policy engine needs the explicit path to resolve sandbox containment
+    // and the default remote URL for domain-based policy rules.
+    // The serverContextMap mirrors the git server's working directory from
+    // successful git_set_working_dir / git_clone calls, avoiding an RPC.
+    let effectiveRawArgs = rawArgs;
+    const hasEffectivePath = 'path' in rawArgs && typeof rawArgs.path === 'string' && rawArgs.path.trim() !== '';
+    if (toolInfo.serverName === 'git' && 'path' in resolvedAnnotation.args && !hasEffectivePath) {
+      const gitWorkDir = deps.serverContextMap.get('git')?.workingDirectory;
+      if (!gitWorkDir) {
+        const errorMsg = 'Git server has no working directory set. Call git_set_working_dir first.';
+        deps.auditLog.log(
+          buildAuditEntry(
+            {
+              requestId: uuidv4(),
+              serverName: toolInfo.serverName,
+              toolName: toolInfo.name,
+              arguments: rawArgs,
+              timestamp: new Date().toISOString(),
+            },
+            rawArgs,
+            { status: 'deny', rule: 'git-path-enrichment-failed', reason: errorMsg },
+            { status: 'denied', error: errorMsg },
+            0,
+            {},
+          ),
+        );
+        return {
+          content: [{ type: 'text', text: `Error: ${errorMsg}` }],
+          isError: true,
+        };
+      }
+      effectiveRawArgs = { ...rawArgs, path: gitWorkDir };
+    }
+
+    ({ argsForTransport, argsForPolicy } = prepareToolArgs(
+      effectiveRawArgs,
+      resolvedAnnotation,
+      deps.allowedDirectory,
+      CONTAINER_WORKSPACE_DIR,
+    ));
+  }
 
   const request: ToolCallRequest = {
     requestId: uuidv4(),
@@ -767,7 +784,7 @@ export async function handleCallTool(
 
     // Expand roots for approved path arguments only (skip URLs, opaques)
     const state = deps.clientStates.get(toolInfo.serverName);
-    if (state) {
+    if (state && annotation) {
       const pathValues = extractAnnotatedPaths(argsForTransport, annotation, getPathRoles());
       for (const p of pathValues) {
         const result = await addRootToClient(state, {
@@ -914,6 +931,7 @@ async function main(): Promise<void> {
   });
 
   const serverDomainAllowlists = extractServerDomainAllowlists(serversConfig);
+  const trustedServers = buildTrustedServerSet(serversConfig);
   const policyEngine = new PolicyEngine(
     compiledPolicy,
     toolAnnotations,
@@ -921,6 +939,7 @@ async function main(): Promise<void> {
     allowedDirectory,
     serverDomainAllowlists,
     dynamicLists,
+    trustedServers,
   );
   const auditLog = new AuditLog(auditLogPath, { redact: auditRedaction });
   const circuitBreaker = new CallCircuitBreaker();

@@ -138,7 +138,13 @@ export async function main(args?: string[]): Promise<void> {
     }
 
     const { runPtySession } = await import('./docker/pty-session.js');
-    await runPtySession({ config, mode, workspacePath, resumeSessionId });
+    await runPtySession({
+      config,
+      mode,
+      workspacePath,
+      resumeSessionId,
+      persona: resumeSessionId ? undefined : personaName,
+    });
     process.exit(0);
   }
 
@@ -166,7 +172,9 @@ export async function main(args?: string[]): Promise<void> {
     });
   } catch (error) {
     initSpinner.fail(chalk.red('Session initialization failed'));
-    throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`\n${chalk.red('Error:')} ${message}\n`);
+    process.exit(1);
   }
 
   initSpinner.succeed(chalk.dim('Session ready'));
