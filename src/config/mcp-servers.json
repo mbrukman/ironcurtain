@@ -12,8 +12,14 @@
     "env": {
       "MCP_TRANSPORT_TYPE": "stdio"
     },
-    "sandbox": false,
-    "_comment": "sandbox: false because @anthropic-ai/sandbox-runtime always runs with --unshare-net (network namespace isolation). On Linux there is no way to selectively allow network access — the SOCKS proxy + GIT_SSH_COMMAND workaround is only implemented on macOS. With sandboxing enabled, git push/fetch/clone over SSH fail with DNS resolution errors. The intended config once upstream supports selective network on Linux: { \"filesystem\": { \"denyRead\": [\"~/.gnupg\", \"~/.aws\"] }, \"network\": { \"allowedDomains\": [\"github.com\", \"*.github.com\", \"gitlab.com\", \"*.gitlab.com\"] } }"
+    "sandbox": {
+      "filesystem": {
+        "denyRead": ["~/.gnupg", "~/.aws"]
+      },
+      "network": {
+        "allowedDomains": ["github.com", "*.github.com", "gitlab.com", "*.gitlab.com"]
+      }
+    }
   },
   "fetch": {
     "description": "HTTP requests and web search",

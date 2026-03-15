@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-03-15
+
+### Features
+
+- **Secure package installation proxy** — npm and PyPI registries are proxied through the MITM layer with metadata filtering (age-gate quarantine, allow/denylists), tarball backstop validation, and per-package audit logging; containers can now `npm install` and `pip install` packages at runtime without direct network access (#101)
+- **Debian apt registry proxy** — `apt-get install` works inside Docker containers by proxying `deb.debian.org` and `security.debian.org` through the MITM proxy; GPG-signed metadata passes through unmodified, `.deb` downloads go through backstop validation (#105)
+- **Memory MCP server integration** — persistent memory with semantic search, LLM summarization, and automatic compaction; integrates with personas and sessions for context-aware recall (#95, #98)
+- **Persona picker in mux mode** — interactive persona selection overlay in the `/new` flow with workspace browsing pre-filled from persona defaults (#104)
+- **Session resume for Docker PTY sessions** — resume previous sessions with `--resume`, conversation state persistence, snapshot validation, and session scanner UI (#94)
+- **Server-namespace tool naming** — tools use `serverName__toolName` format with prefix stripping for cleaner display (#102)
+- **Pre-installed Python 3.12 in Docker base images** — containers no longer need to download Python at runtime, preventing failures in network-isolated environments
+
+### Fixes
+
+- **PyPI sidecar file handling** — strip PEP 658/714 sidecar suffixes (`.metadata`, `.provenance`) before filename parsing in the registry proxy, fixing fail-closed denials for pip/uv metadata fetches (#105)
+- **Memory context missing memories** — fix `memory_context` tool not returning memories and LLM config passthrough (#103)
+- **Roots expansion race condition** — retry tool calls after roots expansion with 200ms delay when the filesystem server hasn't finished processing updated roots (#93)
+- **Harden arm64 Docker base image** — expand system packages with build tools, graphics/Qt libraries, X11/XCB deps, and fonts needed for Python packages with native extensions (#105)
+- Upgrade vulnerable package versions
+
+### Improvements
+
+- **Re-enable OS-level sandbox for git MCP server** — upgrade `@anthropic-ai/sandbox-runtime` to 0.0.42 which supports selective network access on Linux; git server now runs sandboxed with filesystem restrictions (`~/.gnupg`, `~/.aws` denied) and network limited to GitHub/GitLab domains
+- Use `UV_NATIVE_TLS` in Docker base images for MITM CA trust with uv
+- Shared Python install directory (`/opt/uv-python`) across users
+- Use Debian Trixie base for arm64 image (GLVND transition)
+
 ## [0.7.2] - 2026-03-11
 
 ### Fixes
@@ -284,6 +311,10 @@ Initial public release.
 - CI pipeline with Node 22/24 matrix testing
 - Code of Conduct, Contributing guidelines, Security policy
 
+[0.8.0]: https://github.com/provos/ironcurtain/compare/v0.7.2...v0.8.0
+[0.7.2]: https://github.com/provos/ironcurtain/compare/v0.7.1...v0.7.2
+[0.7.1]: https://github.com/provos/ironcurtain/compare/v0.7.0...v0.7.1
+[0.7.0]: https://github.com/provos/ironcurtain/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/provos/ironcurtain/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/provos/ironcurtain/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/provos/ironcurtain/compare/v0.4.1...v0.5.0
