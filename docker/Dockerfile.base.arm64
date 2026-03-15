@@ -24,6 +24,10 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
     mv /root/.local/bin/ruff /usr/local/bin/ruff && \
     rm -rf /root/.local
 
+# Pre-install Python 3.12 so uv never needs to download it at runtime.
+# Containers run with --network=none, so runtime downloads would fail.
+RUN uv python install 3.12
+
 RUN npm install -g node-gyp
 
 RUN mkdir -p /workspace /etc/ironcurtain /run/ironcurtain && \
