@@ -25,6 +25,7 @@ jobs:
         run: npm install -g npm@latest
 
       - run: npm ci
+      - run: npm run build --workspace=packages/memory-mcp-server
       - run: npm run format:check
       - run: npm run lint
       - run: npm run build
